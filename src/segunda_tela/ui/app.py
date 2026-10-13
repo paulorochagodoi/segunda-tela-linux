@@ -15,7 +15,11 @@ def run_ui(args) -> int:
         gi.require_version("Adw", "1")
         from gi.repository import Adw, GLib, Gtk
     except Exception as exc:  # noqa: BLE001
-        log.error("GTK4/libadwaita not available (%s). Use CLI without --ui.", exc)
+        from .deps_error import gi_missing_message
+
+        msg = gi_missing_message(exc)
+        log.error("%s", msg)
+        print(msg, flush=True)
         return 2
 
     from ..session import SecondScreenSession

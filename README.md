@@ -27,11 +27,28 @@ como segunda tela no **Pop!_OS** e outros desktops Linux, via **Wi-Fi Display
 - Pop!_OS 22.04 ou 24.04 (ou Ubuntu equivalente)
 - Python 3.10+
 - GStreamer 1.0 + plugins (good/ugly/libav/pipewire)
-- Opcional: GTK4 + libadwaita (`--ui`)
+- GTK4 + libadwaita via **pacotes do sistema** (`python3-gi`, `gir1.2-gtk-4.0`, `gir1.2-adw-1`) — a UI (`--ui`) precisa deles
+- O `install.sh` cria o venv com `--system-site-packages` para o Python ver o `gi`
 
 ```bash
 sudo ./scripts/install-deps-popos.sh
 ./scripts/install.sh
+segunda-tela --ui
+```
+
+### UI: «No module named gi»
+
+O `gi` **não** se instala com pip no venv isolado. Reinstale assim:
+
+```bash
+sudo apt update
+sudo apt install -y python3-gi python3-gi-cairo gir1.2-gtk-4.0 gir1.2-adw-1 \
+  gstreamer1.0-tools gstreamer1.0-plugins-base gstreamer1.0-plugins-good \
+  gstreamer1.0-plugins-ugly gstreamer1.0-libav gstreamer1.0-pipewire
+cd /caminho/do/segunda-tela-linux
+rm -rf .venv
+./scripts/install.sh
+segunda-tela --ui
 ```
 
 ## Uso
@@ -90,8 +107,12 @@ Samsung’s proprietary MCF “Second Screen” one-tap pairing is **out of scop
 ```bash
 sudo ./scripts/install-deps-popos.sh && ./scripts/install.sh
 segunda-tela --loopback-test
-segunda-tela
+segunda-tela --ui
 ```
+
+If `--ui` says `No module named gi`, install system PyGObject/GTK4 and recreate
+the venv with `./scripts/install.sh` (it uses `--system-site-packages`). See the
+Portuguese troubleshooting block above for exact `apt` commands.
 
 
 ### USB cable mode
