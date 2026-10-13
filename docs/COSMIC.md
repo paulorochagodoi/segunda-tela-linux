@@ -20,7 +20,7 @@ Galaxy Tab (sink Miracast)
  Wi-Fi Direct (NetworkManager, grupo p2p-wlo1-N, IP 192.168.49.x típico)
       │
  segunda-tela ── EVDI: conector virtual com EDID 1920x1200 / 2560x1600 / 1080p
-             └─ captura SÓ esse output (portal ScreenCast → PipeWire)
+             └─ captura SÓ esse output (leitura direta do EVDI; portal só como fallback)
              └─ vah264enc (VA-API amdgpu) → mpegtsmux → rtpmp2tpay → UDP
 ```
 
@@ -62,10 +62,13 @@ segunda-tela --mode extend --device "Galaxy Tab S9"
 O que acontece, na ordem:
 
 1. **EVDI**: aparece um monitor novo "Segunda Tela" para o COSMIC.
-2. **Portal**: o seletor do COSMIC abre — **escolha "Segunda Tela" (o
-   virtual), não o eDP-1**. Pedimos `persist_mode=2`; o token fica em
-   `~/.config/segunda-tela/portal.json` para não perguntar de novo (se o portal
-   do COSMIC suportar — ver Incertezas). Escolheu errado? apague esse arquivo.
+2. **Captura**: os quadros são lidos direto do EVDI (`evdi_grab_pixels`),
+   sem portal e sem diálogo — só o monitor virtual pode ser capturado.
+   Com `--capture portal` (ou se o EVDI não abrir) o seletor do COSMIC abre:
+   escolha "Segunda Tela". Uma escolha lembrada em
+   `~/.config/segunda-tela/portal.json` que aponte para o eDP-1 (ou outra
+   saída que não seja o EVDI) é apagada automaticamente e o seletor reabre;
+   se ainda assim vier a tela errada, voltamos para a leitura do EVDI.
 3. **Wi-Fi Direct**: o NetworkManager forma o grupo P2P (o tablet pode pedir
    para aceitar a conexão).
 4. **RTSP/WFD**: o tablet abre TCP 7236; negociamos o modo (preferimos
@@ -85,8 +88,8 @@ a posição pelo EDID (nome/serial fixos), então isso deve ser uma vez só.
 
 | Opção | Efeito |
 |-------|--------|
-| `--capture evdi` | Lê os pixels direto do EVDI (sem portal, sem diálogo). Mais CPU (cópia), mas garante capturar só o monitor virtual. Use se o portal não persistir/escolher errado. |
-| `--capture portal` | Padrão no Wayland. |
+| `--capture evdi` | Padrão no modo estender: lê os pixels direto do EVDI (sem portal, sem diálogo). Falha em vez de cair no portal se o EVDI não abrir. |
+| `--capture portal` | Captura pelo portal ScreenCast (fallback; padrão no modo espelhar). |
 | `--width 1920 --height 1080` | Força modo (se o tablet anunciar). |
 | `--fps 30` | Limita fps (padrão 60 com VA-API, 30 com x264). |
 | `--encoder x264enc` | Força encoder por software. |
@@ -115,7 +118,7 @@ sudo ufw allow in on p2p-wlo1-0    # DHCP do grupo P2P (o nome pode ser p2p-wlo1
 | `list` vazio | Tablet na tela de recepção? `nmcli device` mostra `p2p-dev-wlo1`? `segunda-tela list --all` mostra algo sem WFD? |
 | Conecta P2P, mas nada no tablet | `-v`: chegou `RTSP sink connected`? Se não, firewall; se sim, veja qual M falhou. |
 | Tablet mostra preto | Log `gst:`; `segunda-tela doctor` (vah264enc presente?); tente `--encoder x264enc`. |
-| Capturou a tela errada | Apague `~/.config/segunda-tela/portal.json` ou use `--capture evdi`. |
+| Capturou a tela errada | Só acontece com `--capture portal`/fallback; rode sem `--capture` (padrão: EVDI) e veja o log `Captura:`. |
 | Monitor virtual não aparece | `segunda-tela doctor`; `ls /sys/bus/platform/devices/ | grep evdi`; `journalctl -b | grep -i evdi`. |
 
 ## Incertezas (não verificadas em hardware)
@@ -149,12 +152,12 @@ sudo ufw allow in on p2p-wlo1-0    # DHCP do grupo P2P (o nome pode ser p2p-wlo1
 1. `sudo ./scripts/install-deps-popos.sh && sudo ./scripts/setup-evdi.sh && ./scripts/install.sh`
 2. `segunda-tela doctor` → all `[ok]` (Secure Boot users: enroll the DKMS MOK key).
 3. On the tablet open the wireless display receiver; `segunda-tela list`.
-4. `segunda-tela --mode extend --device "<tablet name>"` → pick **"Segunda Tela"**
-   (the virtual output) in the COSMIC portal dialog, accept the Wi-Fi Direct
-   prompt on the tablet.
+4. `segunda-tela --mode extend --device "<tablet name>"` → accept the Wi-Fi
+   Direct prompt on the tablet. No portal dialog: frames come straight from
+   the EVDI output.
 5. First time only: arrange the new display in COSMIC Settings → Displays.
 
-`--capture evdi` skips the portal and reads frames straight from the EVDI
-connector. Untested on real hardware: COSMIC portal persistence, COSMIC
+`--capture portal` uses the ScreenCast portal instead (fallback); a remembered
+portal choice that is not the EVDI output (e.g. eDP-1) is discarded. Untested on real hardware: COSMIC portal persistence, COSMIC
 accepting the EVDI card, MT7922 GO stability, and whether Smart View accepts a
 non-Samsung source for anything beyond mirroring.

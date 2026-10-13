@@ -4,9 +4,9 @@ Uses the distro `evdi-dkms` kernel module and `libevdi1` userspace library
 (DisplayLink's open-source EVDI). We do not ship or build a kernel module.
 
 Once connected with our EDID, the compositor (cosmic-comp, mutter, …) sees a
-new DRM connector and can extend the desktop onto it. Frames can then be
-captured through the ScreenCast portal (default) or grabbed straight from
-EVDI (`--capture evdi`), which needs no portal dialog.
+new DRM connector and can extend the desktop onto it. Frames are grabbed
+straight from EVDI (default in extend mode, no portal dialog); the
+ScreenCast portal is only a fallback.
 
 Hardware path — not exercised in CI.
 """
@@ -223,6 +223,13 @@ class EvdiMonitor:
                 self._handle = None
                 log.info("EVDI disconnected")
 
+    def enable_grab(self) -> None:
+        """Start grabbing frames after open() (portal fallback → EVDI grab).
+
+        The buffer is registered by the event thread, which owns libevdi calls.
+        """
+        self.grab = True
+
     # -------------------------------------------------------------- frames
     def wait_frame(self, after_seq: int, timeout: float) -> tuple[int, Optional[bytes]]:
         with self._frame_lock:
@@ -289,6 +296,8 @@ class EvdiMonitor:
         interval = 1.0 / self.fps
         next_req = 0.0
         while self._running:
+            if self.grab and self._buf_desc is None and self.mode is not None:
+                self._register_buffer(self.mode[0], self.mode[1])
             now = time.monotonic()
             if self.grab and self._buf_desc is not None and not self._pending and now >= next_req:
                 next_req = now + interval

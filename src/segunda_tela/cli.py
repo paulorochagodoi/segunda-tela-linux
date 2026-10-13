@@ -56,7 +56,8 @@ def build_parser() -> argparse.ArgumentParser:
         "--capture",
         choices=["auto", "portal", "evdi", "x11", "test"],
         default="auto",
-        help="Frame source: portal (ScreenCast), evdi (grab virtual output directly), x11, test pattern",
+        help="Frame source (auto: extend → evdi, portal only as fallback; mirror → portal/x11): "
+             "evdi (grab the virtual output directly), portal (ScreenCast), x11, test pattern",
     )
     p.add_argument(
         "--encoder",
