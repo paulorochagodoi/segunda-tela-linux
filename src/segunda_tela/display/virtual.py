@@ -34,6 +34,7 @@ class VirtualDisplay:
     fps: int = 30
     evdi: Optional[object] = None  # EvdiMonitor
     portal: Optional[object] = None  # PortalCapture
+    layout: Optional[object] = None  # randr.EvdiLayoutStatus
     notes: list[str] = field(default_factory=list)
 
     @property
@@ -177,6 +178,7 @@ def create_virtual_display(
                     "O compositor ainda não ativou o monitor virtual. Em Configurações → Telas, "
                     "ative/posicione 'Segunda Tela' (ver docs/COSMIC.md)."
                 )
+            _check_layout(disp)
         if backend == "evdi":
             disp.backend = "evdi-grab"
             log.info("Captura: leitura direta do EVDI (sem portal)")
@@ -190,6 +192,20 @@ def create_virtual_display(
         return disp
 
     raise ValueError(f"unknown capture backend {backend!r}")
+
+
+def _check_layout(disp: VirtualDisplay) -> None:
+    """Log the compositor layout; note clearly if EVDI is mirrored or absent."""
+    from .randr import check_layout
+
+    try:
+        st = check_layout()
+    except Exception as exc:  # noqa: BLE001 — diagnostics must never stop the session
+        log.warning("layout check failed: %s", exc)
+        return
+    disp.layout = st
+    if st.status in ("absent", "disabled", "mirrored"):
+        disp.notes.append(f"AVISO (tela estendida): {st.message}")
 
 
 def _open_portal(disp: VirtualDisplay, restore: bool) -> None:
@@ -214,7 +230,8 @@ def _open_portal(disp: VirtualDisplay, restore: bool) -> None:
         mon = disp.evdi
         expected = mon.mode[:2] if mon.mode else None
         stream = cap.streams[0]
-        if stream_is_output(stream, expected):
+        evdi_out = getattr(disp.layout, "output", None)
+        if stream_is_output(stream, expected, evdi_out.position if evdi_out else None):
             disp.portal = cap
             return
         cap.close()

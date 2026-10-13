@@ -4,6 +4,7 @@ import pytest
 
 import segunda_tela.display.evdi as evdi_mod
 import segunda_tela.display.portal as portal
+import segunda_tela.display.randr as randr
 import segunda_tela.display.virtual as virtual
 from segunda_tela.display.portal import PortalCapture, PortalStream, forget_restore_token, stream_is_output
 
@@ -35,6 +36,7 @@ def _cap(pos, size=(1920, 1200)):
 
 @pytest.fixture
 def cfg(tmp_path, monkeypatch):
+    monkeypatch.setattr(randr, "check_layout", lambda: randr.EvdiLayoutStatus("unknown", None, "n/a"))
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
     monkeypatch.setenv("XDG_SESSION_TYPE", "wayland")
     return tmp_path / "segunda-tela" / "portal.json"
@@ -108,3 +110,22 @@ def test_stream_is_output():
     assert not stream_is_output(PortalStream(2, position=(0, 0), size=(1920, 1200)), (1920, 1200))
     # Layout known: an EVDI output placed at (0,0) is accepted.
     assert stream_is_output(PortalStream(3, position=(0, 0), size=(1920, 1200)), (1920, 1200), output_pos=(0, 0))
+
+
+def test_portal_validated_against_compositor_layout(cfg, monkeypatch):
+    evdi_out = randr.Output("DVI-I-1", x=-1920, y=0, width=1920, height=1200)
+    monkeypatch.setattr(randr, "check_layout", lambda: randr.EvdiLayoutStatus("extended", evdi_out, "ok"))
+    monkeypatch.setattr(evdi_mod, "EvdiMonitor", FakeMonitor)
+    # (1920,0) passes the position heuristic but is not where COSMIC put the EVDI output.
+    picks = iter([_cap((1920, 0)), _cap((-1920, 0))])
+    monkeypatch.setattr(portal, "open_screencast", lambda **kw: next(picks))
+    disp = virtual.create_virtual_display(1920, 1200, "extend", 30, capture="portal")
+    assert disp.backend == "portal" and disp.portal.streams[0].position == (-1920, 0)
+
+
+def test_mirrored_layout_is_reported(cfg, monkeypatch):
+    monkeypatch.setattr(randr, "check_layout",
+                        lambda: randr.EvdiLayoutStatus("mirrored", None, "DVI-I-1 está ESPELHANDO eDP-1"))
+    monkeypatch.setattr(evdi_mod, "EvdiMonitor", FakeMonitor)
+    disp = virtual.create_virtual_display(1920, 1200, "extend", 30)
+    assert any("ESPELHANDO" in n for n in disp.notes)

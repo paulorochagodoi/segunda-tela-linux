@@ -95,7 +95,8 @@ def build_parser() -> argparse.ArgumentParser:
     list_p = sub.add_parser("list", help="Discover Wi-Fi P2P peers (Miracast sinks)")
     list_p.add_argument("--timeout", type=float, default=15.0, help="Discovery seconds (default 15)")
     list_p.add_argument("--all", action="store_true", help="Also show peers without WFD IEs")
-    sub.add_parser("doctor", help="Check EVDI, GStreamer encoders, NetworkManager P2P, portal and USB/adb")
+    sub.add_parser("doctor", help="Check EVDI (and that COSMIC extends onto it), GStreamer encoders, "
+                                  "NetworkManager P2P, portal and USB/adb")
     return p
 
 
@@ -172,6 +173,16 @@ def cmd_doctor(_args) -> int:
             s.finish_setup()
     except Exception as exc:  # noqa: BLE001
         line(False, "ScreenCast portal", str(exc))
+
+    from .display.randr import layout_checks, probe_evdi_layout
+
+    print("-- Tela estendida (COSMIC) --")
+    can_probe = ev.module_loaded() and bool(ev.evdi_cards())
+    for status, label, detail in layout_checks(probe=probe_evdi_layout if can_probe else None):
+        if status == "info":
+            print(f"[..] {label}{(' — ' + detail) if detail else ''}")
+        else:
+            line(status == "ok", label, detail)
 
     from .usb.doctor import usb_checks
 

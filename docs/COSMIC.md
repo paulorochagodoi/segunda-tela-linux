@@ -77,6 +77,11 @@ O que acontece, na ordem:
 
 ### Organizar as telas (uma vez)
 
+Ao conectar, o app consulta o layout com `cosmic-randr list` (ou `wlr-randr`),
+registra todas as saídas no log e **avisa se a "Segunda Tela" está ausente,
+desligada ou espelhando/sobreposta ao eDP-1**. `segunda-tela doctor` faz o
+mesmo teste conectando o monitor virtual por alguns segundos.
+
 Na primeira vez, o COSMIC coloca o monitor virtual em algum lado do eDP-1.
 Abra **Configurações → Telas** e arraste "Segunda Tela" para a posição real do
 tablet (esquerda/direita/acima), e escolha a resolução (1920x1200 recomendado —
@@ -120,6 +125,8 @@ sudo ufw allow in on p2p-wlo1-0    # DHCP do grupo P2P (o nome pode ser p2p-wlo1
 | Tablet mostra preto | Log `gst:`; `segunda-tela doctor` (vah264enc presente?); tente `--encoder x264enc`. |
 | Capturou a tela errada | Só acontece com `--capture portal`/fallback; rode sem `--capture` (padrão: EVDI) e veja o log `Captura:`. |
 | Monitor virtual não aparece | `segunda-tela doctor`; `ls /sys/bus/platform/devices/ | grep evdi`; `journalctl -b | grep -i evdi`. |
+| Log `EVDI: … ESPELHANDO …` / `sobrepõe eDP-1` | O COSMIC está espelhando em vez de estender: Configurações → Telas → arraste "Segunda Tela" para o lado do eDP-1 (modo "Juntar/Estender"). |
+| Log `EVDI: … NÃO aparece no layout` | O cosmic-comp não usou o card evdi. Confira `cosmic-randr list` e `journalctl --user -b | grep -i cosmic-comp`. |
 
 ## Incertezas (não verificadas em hardware)
 
