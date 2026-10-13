@@ -1,18 +1,16 @@
 """GStreamer encode + WFD media transport.
 
-WFD sinks expect H.264 in an MPEG-2 Transport Stream, payloaded as RTP/MP2T
-(payload type 33) — video on PID 0x1011, audio on PID 0x1100 — sent to the
-sink's RTP port (19000 on Samsung). This matches gnome-network-displays:
-`mpegtsmux alignment=7`, `rtpmp2tpay pt=33 ssrc=1 perfect-rtptime=false`,
-SPS/PPS in front of every IDR (`h264parse config-interval=-1`), a fixed GOP,
-constant frame rate, and an AAC (or LPCM) elementary stream.
+The graph is the one gnome-network-displays builds in wfd-media-factory.c:
+videoscale → framerate caps → videoconvert → queue(1) → encoder → identity →
+h264parse config-interval=-1 → byte-stream caps → queue(500 ms) →
+mpegtsmux alignment=7 sink_4113, audio on sink_4352, rtpmp2tpay ssrc=1
+perfect-rtptime=false. `rtpbin` is not used.
 
-`rtpbin` is intentionally absent. Linking it from gst-launch
-(`rtpbin.send_rtp_sink_0` + `recv_rtcp_sink`) hits
-`gst_mini_object_unref: assertion 'mini_object != NULL' failed` in
-`gst_rtp_session_send_rtp` when the send pad is not ready, and the tablet
-then tears the session down. RTCP is not required: the Tab S10 FE reports
-RTCP port 0.
+`pipewiresrc keepalive-time>0` unrefs a NULL last-buffer on the first frame
+(gstpipewiresrc, PipeWire commit 6c25924). The capture fragment may set that
+property; it is stripped here so the critical does not fire. videorate is
+only `drop-only` (60 fps portal node → the negotiated rate) and does not use
+`skip-to-first`, which duplicates buffers across a bad segment.
 
 Encoder preference (first available wins):
   vah264enc (GStreamer `va` plugin, AMD/Intel)  →  vaapih264enc (gstreamer1.0-vaapi)
@@ -22,6 +20,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import shlex
 import shutil
 import subprocess
@@ -37,12 +36,13 @@ VIDEO_PID = 0x1011
 AUDIO_PID = 0x1100
 ENCODER_ORDER = ("vah264enc", "vaapih264enc", "x264enc", "openh264enc")
 HW_ENCODERS = ("vah264enc", "vaapih264enc")
-# 90 kHz MPEG clock. PAT/PMT every 100 ms, PCR every 40 ms (ISO/IEC 13818-1
-# requires a PCR at least every 100 ms; 40 ms is mpegtsmux's own default).
+# mpegtsmux defaults (90 kHz): PAT/PMT 100 ms, PCR 40 ms. GND sets only alignment.
 PAT_INTERVAL_TICKS = 9000
 PMT_INTERVAL_TICKS = 9000
 PCR_INTERVAL_TICKS = 3600
-SILENT_AUDIO_SOURCE = "audiotestsrc is-live=true wave=silence do-timestamp=true"
+SILENT_AUDIO_SOURCE = "audiotestsrc is-live=true wave=silence"
+# pipewiresrc unrefs NULL when this is > 0. See module docstring.
+_KEEPALIVE_TIME = re.compile(r"\s*keepalive-time=\d+")
 
 
 @dataclass
@@ -94,11 +94,12 @@ def pick_encoder(preferred: str = "auto", available: Callable[[str], bool] = gst
     return "x264enc"
 
 
-def _level_token(level_idc: Optional[int]) -> str:
+def _level_option(level_idc: Optional[int]) -> str:
+    """x264 `level=` so the SPS level_idc is exactly the negotiated level."""
     if not level_idc:
         return ""
     major, minor = divmod(int(level_idc), 10)
-    return f":level={major}.{minor}"
+    return f' option-string="level={major}.{minor}"'
 
 
 def encoder_fragment(
@@ -108,13 +109,14 @@ def encoder_fragment(
     profile: str = "constrained-baseline",
     level_idc: Optional[int] = None,
 ) -> str:
-    """One IDR per second (`key-int-max` = fps), no B-frames.
+    """Property values from wfd_configure_media_element.
 
-    CBP (the WFD mandatory profile) is cabac off and 8x8dct off. CHP is the
-    high profile with the same no-B-frame constraint. x264 also repeats
-    SPS/PPS on every IDR (`repeat-headers`) and disables scene-cut so the
-    GOP stays regular; `h264parse config-interval=-1` does the same again
-    downstream, which is what gnome-network-displays relies on.
+    GOP is one second (`key-int-max` / `gop-size` = refresh rate). CBP is
+    cabac off and dct8x8 off. x264's `pass=4` in that source is the enum
+    value of constant-quantizer on GStreamer 1.x (`pass=quant`); the comment
+    there says CBR, but the integer it sets is quant. `level_idc` is an
+    extra x264 option so the SPS matches the sink level exactly — GND itself
+    never sets a level.
     """
     gop = max(1, fps)
     high = profile == "high"
@@ -122,25 +124,29 @@ def encoder_fragment(
     dct = "true" if high else "false"
     if encoder == "vah264enc":
         return (
-            f"vah264enc rate-control=cbr bitrate={bitrate_kbps} key-int-max={gop} "
-            f"b-frames=0 ref-frames=1 cabac={cabac} dct8x8={dct} num-slices=1"
+            f"vah264enc qos=true key-int-max={gop} num-slices=1 "
+            f"cabac={cabac} dct8x8={dct} bitrate={bitrate_kbps}"
         )
     if encoder == "vaapih264enc":
         return (
-            f"vaapih264enc rate-control=cbr bitrate={bitrate_kbps} keyframe-period={gop} "
-            f"max-bframes=0 refs=1 cabac={cabac} dct8x8={dct} num-slices=1"
+            f"vaapipostproc ! vaapih264enc qos=true rate-control=2 keyframe-period={gop} "
+            f"max-bframes=0 refs=1 num-slices=1 cabac={cabac} dct8x8={dct} "
+            f"compliance-mode=0 bitrate={bitrate_kbps}"
         )
     if encoder == "openh264enc":
-        # openh264 is constrained-baseline only.
+        bits = bitrate_kbps * 1000
         return (
-            f"openh264enc bitrate={bitrate_kbps * 1000} gop-size={gop} "
-            f"usage-type=screen rate-control=bitrate enable-frame-skip=false"
+            f"openh264enc qos=true multi-thread=1 usage-type=screen slice-mode=n-slices "
+            f"num-slices=1 rate-control=bitrate gop-size={gop} enable-frame-skip=false "
+            f"scene-change-detection=true background-detection=true complexity=low "
+            f"bitrate={bits} max-bitrate={bits}"
         )
-    level = _level_token(level_idc)
     return (
-        f"x264enc tune=zerolatency speed-preset=ultrafast bitrate={bitrate_kbps} "
-        f"key-int-max={gop} bframes=0 byte-stream=true cabac={cabac} dct8x8={dct} ref=1 "
-        f"insert-vui=true aud=true option-string=\"scenecut=0:repeat-headers=1{level}\""
+        f"x264enc qos=true pass=quant tune=zerolatency speed-preset=ultrafast "
+        f"rc-lookahead=0 threads=1 vbv-buf-capacity=50 dct8x8={dct} ref=1 cabac={cabac} "
+        f"sync-lookahead=0 b-adapt=false bframes=0 key-int-max={gop} interlaced=false "
+        f"bitrate={bitrate_kbps} insert-vui=true sliced-threads=false"
+        + _level_option(level_idc)
     )
 
 
@@ -163,26 +169,24 @@ def _audio_kind(audio: Optional[str]) -> Optional[str]:
 
 
 def _audio_branch(kind: str, audio_source: Optional[str]) -> str:
+    # Order matches wfd_media_factory_create_audio_element: resample, convert,
+    # encoder, then a 500 ms queue onto PID 0x1100. Caps are channels + rate only.
     src = audio_source or SILENT_AUDIO_SOURCE
-    head = (
-        f"{src} ! queue max-size-time=500000000 leaky=0 ! audioconvert ! audioresample ! "
-        f"audio/x-raw,rate=48000,channels=2"
-    )
+    head = f"{src} ! audioresample ! audioconvert"
+    queue = f"queue max-size-buffers=100000 max-size-time=500000000 leaky=0 ! mux.sink_{AUDIO_PID}"
     if kind == "lpcm":
-        # mpegtsmux accepts audio/x-lpcm (Blu-ray private stream). capssetter
-        # relabels S16LE; join=false is required or it keeps audio/x-raw.
         return (
-            f"{head},format=S16LE ! capssetter join=false replace=true "
+            f"{head} ! audio/x-raw,format=S16LE,rate=48000,channels=2 ! "
+            f"capssetter join=false replace=true "
             f'caps="audio/x-lpcm,width=(int)16,rate=(int)48000,channels=(int)2,'
-            f'dynamic_range=(int)0,emphasis=(boolean)false,mute=(boolean)false" '
-            f"! queue ! mux.sink_{AUDIO_PID}"
+            f'dynamic_range=(int)0,emphasis=(boolean)false,mute=(boolean)false" ! {queue}'
         )
-    # ADTS so mpegtsmux does not require a separate codec_data buffer.
-    return (
-        f"{head} ! avenc_aac bitrate=128000 ! aacparse ! "
-        f"audio/mpeg,mpegversion=4,stream-format=adts,framed=true,rate=48000,channels=2 ! "
-        f"queue ! mux.sink_{AUDIO_PID}"
-    )
+    return f"{head} ! avenc_aac ! audio/mpeg,channels=2,rate=48000 ! {queue}"
+
+
+def sanitize_capture_gst(gst: str) -> str:
+    """Drop pipewiresrc keepalive-time so the first buffer is not unref'd as NULL."""
+    return _KEEPALIVE_TIME.sub("", gst)
 
 
 def build_pipeline(
@@ -210,21 +214,29 @@ def build_pipeline(
     del rtcp_port  # RTP only — see module docstring
     if encoder == "openh264enc":
         profile = "constrained-baseline"
+    if profile == "high":
+        codec_caps = "video/x-h264,stream-format=byte-stream,profile=high"
+    else:
+        # Same two profiles gnome-network-displays puts on one capsfilter.
+        # A set avoids a semicolon, which gst-launch would treat as a new element.
+        codec_caps = "video/x-h264,stream-format=byte-stream,profile=(string){constrained-baseline,baseline}"
+    capture = sanitize_capture_gst(source.gst)
+    # drop-only videorate turns a 60 fps portal node into the negotiated rate.
+    # GND has no videorate because its source already negotiates that rate.
     video = (
-        f"{source.gst} ! queue leaky=downstream max-size-buffers=2 ! "
-        f"videoconvert ! videoscale ! videorate drop-only=false skip-to-first=true ! "
-        f"video/x-raw,format=NV12,width={width},height={height},framerate={fps}/1,pixel-aspect-ratio=1/1 ! "
+        f"{capture} ! videoscale qos=true ! videorate drop-only=true ! "
+        f"video/x-raw,framerate={fps}/1,width={width},height={height} ! "
+        f"videoconvert qos=true ! queue max-size-buffers=1 leaky=0 ! "
         f"{encoder_fragment(encoder, bitrate_kbps, fps, profile, level_idc)} ! "
-        f"h264parse name=wfd-h264parse config-interval=-1 ! "
-        f"video/x-h264,profile={profile},stream-format=byte-stream,alignment=au ! "
-        f"queue max-size-buffers=4 max-size-time=500000000 ! mux.sink_{VIDEO_PID}"
+        f"identity ! h264parse name=wfd-h264parse config-interval=-1 ! "
+        f"{codec_caps} ! "
+        f"queue max-size-buffers=1000 max-size-time=500000000 ! mux.sink_{VIDEO_PID}"
     )
     transport = (
-        f"mpegtsmux name=mux alignment=7 pat-interval={PAT_INTERVAL_TICKS} "
-        f"pmt-interval={PMT_INTERVAL_TICKS} pcr-interval={PCR_INTERVAL_TICKS} ! "
+        f"mpegtsmux name=mux alignment=7 ! "
         f"queue max-size-buffers=1 leaky=0 ! "
         f"rtpmp2tpay pt=33 ssrc=1 perfect-rtptime=false timestamp-offset=0 seqnum-offset=0 ! "
-        f"udpsink host={dest_host} port={rtp_port} bind-port={local_rtp_port} sync=false async=false"
+        f"udpsink host={dest_host} port={rtp_port} bind-port={local_rtp_port} sync=true async=false"
     )
     parts = [video, transport]
     kind = _audio_kind(audio) or (_audio_kind("aac") if audio_source else None)

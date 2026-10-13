@@ -75,12 +75,18 @@ def main(argv: list[str] | None = None) -> int:
     except Exception as exc:  # noqa: BLE001 — GLib may raise GError
         print(f"parse_launch failed: {exc}", file=sys.stderr)
         return 1
+    # Same 500 ms latency gnome-network-displays sets on the pipeline
+    # (openh264 screen mode spikes; a short latency underruns the mux).
+    pipeline.set_latency(500 * Gst.MSECOND)
 
     def _stop(*_args: object) -> None:
         pipeline.send_event(Gst.Event.new_eos())
 
     signal.signal(signal.SIGTERM, _stop)
     pipeline.set_state(Gst.State.PLAYING)
+    # Wait out the state change before any force-key-unit. Sending that
+    # event during preroll walks a pad that has no buffer yet.
+    pipeline.get_state(Gst.CLOCK_TIME_NONE)
     if idr_fd >= 0:
         threading.Thread(target=_idr_loop, args=(pipeline, idr_fd), name="wfd-idr", daemon=True).start()
 

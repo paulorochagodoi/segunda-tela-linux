@@ -33,6 +33,7 @@ class SecondScreenSession:
         encoder: str = "auto",
         audio: bool = False,
         probe_hdcp: bool = False,
+        gnd_compat: bool = False,
     ) -> None:
         self.want_size = (width, height) if width and height else None
         self.mode = mode
@@ -46,6 +47,7 @@ class SecondScreenSession:
         self.fps = fps or (60 if self.encoder in HW_ENCODERS else 30)
         self.audio = audio
         self.probe_hdcp = probe_hdcp
+        self.gnd_compat = gnd_compat
         self.display: Optional[VirtualDisplay] = None
         self.server: Optional[WfdRtspServer] = None
         self.pipeline: Optional[StreamPipeline] = None
@@ -136,6 +138,7 @@ class SecondScreenSession:
             audio=True,
             encoder=self.encoder,
             probe_hdcp=self.probe_hdcp,
+            gnd_compat=self.gnd_compat,
         )
         self.server.start_background()
 
@@ -145,7 +148,9 @@ class SecondScreenSession:
         if self.usb_link and self.usb_link.transport.startswith("adb"):
             log.info("PLAY via adb — RTP/UDP may need USB tethering (adb reverse only carries TCP)")
         assert self.display is not None
-        bitrate = self.bitrate_kbps or default_bitrate_kbps(mode.width, mode.height, mode.fps)
+        bitrate = self.bitrate_kbps or (
+            negotiated.bitrate_kbps if negotiated else default_bitrate_kbps(mode.width, mode.height, mode.fps)
+        )
         with self._plock:
             if self.pipeline:
                 self.pipeline.stop()

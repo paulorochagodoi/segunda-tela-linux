@@ -69,6 +69,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="Send desktop audio. A silent AAC/LPCM track is already negotiated when the sink offers one "
         "(Samsung treats a video-only MPEG-TS as not secure)",
     )
+    p.add_argument(
+        "--gnd-compat",
+        action="store_true",
+        help="Literal gnome-network-displays resolution: always 1920x1080p30, and do not force the "
+             "SPS level. Without this flag the RTSP messages and encoder graph already match that "
+             "project, but the mode is the best one inside the sink's H.264 level (720p30 on the "
+             "Tab S10 FE, whose level byte 0x01 is only 3.1) and the SPS level matches that mode.",
+    )
     p.add_argument("--port", type=int, default=7236, help="WFD RTSP port (default 7236)")
     p.add_argument("--bind", default="0.0.0.0")
     p.add_argument("--ui", action="store_true", help="Launch GTK UI")
@@ -261,6 +269,7 @@ def main(argv: list[str] | None = None) -> int:
         encoder=args.encoder,
         audio=args.audio,
         probe_hdcp=args.probe_hdcp,
+        gnd_compat=args.gnd_compat,
     )
 
     def _stop(*_a):

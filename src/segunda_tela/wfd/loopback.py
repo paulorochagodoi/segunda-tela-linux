@@ -49,15 +49,16 @@ def run_wfd_loopback(port: int = 17236) -> bool:
     try:
         res = run_fake_sink("127.0.0.1", port)
         vf = res.m4_params.get("wfd_video_formats", "")
-        assert vf.split()[5] == "20000000", vf  # VESA bit 29 = 1920x1200p60
+        assert vf.split()[5] == "10000000", vf  # VESA bit 28 = 1920x1200p30 (p60 exceeds level 4.2)
         assert res.m4_params.get("wfd_audio_codecs", "").startswith("AAC "), res.m4_params
         assert res.m4_params["wfd_client_rtp_ports"].split()[1] == "19000"
-        assert res.m4_params["wfd_presentation_url"].startswith("rtsp://127.0.0.1/wfd1.0/streamid=0")
+        assert res.m4_params["wfd_presentation_url"].startswith("rtsp://127.0.0.1:")
+        assert res.m4_params["wfd_presentation_url"].endswith("/wfd1.0/streamid=0 none")
         assert res.setup_reply and res.setup_reply.status == 200
         assert res.play_reply and res.play_reply.status == 200
         time.sleep(0.1)
         mode, rtp, _rtcp = events["play"]
-        assert (mode.width, mode.height, mode.fps, rtp) == (1920, 1200, 60, 19000), events
+        assert (mode.width, mode.height, mode.fps, rtp) == (1920, 1200, 30, 19000), events
         assert events.get("teardown")
         log.info("loopback WFD (M1–M7) OK: %s", mode)
         return True
