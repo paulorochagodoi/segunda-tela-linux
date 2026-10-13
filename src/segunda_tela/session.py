@@ -145,6 +145,7 @@ class SecondScreenSession:
     def _on_play(self, state: SessionState) -> None:
         self.last_state = state
         mode = state.mode
+        negotiated = state.negotiated
         if self.usb_link and self.usb_link.transport.startswith("adb"):
             log.info("PLAY via adb — RTP/UDP may need USB tethering (adb reverse only carries TCP)")
         assert self.display is not None
@@ -154,7 +155,6 @@ class SecondScreenSession:
         with self._plock:
             if self.pipeline:
                 self.pipeline.stop()
-            negotiated = state.negotiated
             self.pipeline = StreamPipeline(
                 capture_source=self.display.new_capture(),
                 dest_host=state.rtp_host,
