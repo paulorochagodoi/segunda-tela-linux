@@ -93,6 +93,63 @@ EVDI DKMS), **not** a from-scratch kernel driver.
 - Without a Galaxy Tab on the bench, end-to-end hardware validation is **untested**.
 - Do not claim affiliation with Samsung.
 
+## Addendum: managed members & native boundaries (REA, 2026-10-12)
+
+Source: REA `inspect-managed-members` and `inspect-managed-native-boundaries`
+over the four assemblies below (metadata only; no IL bodies decompiled or
+committed). All four are IL-only, not ReadyToRun, and not strong-name signed.
+
+| Assembly | SHA-256 (prefix) | P/Invoke | Native imports |
+|----------|------------------|----------|----------------|
+| `Samsung.SecondScreen.Connection.dll` | `d580f7ea…` | 0 | none |
+| `Samsung.SecondScreen.MCF.dll` | `d098170c…` | 0 | none (MCF native work is in `McfSdkLib*`) |
+| `Samsung.SecondScreen.Display.dll` | `dc80d946…` | 17 | `user32` CCD/GDI display APIs, `kernel32` Wow64 FS redirection |
+| `Samsung.SecondScreen.Input.dll` | `0db1024e…` | 7 | `user32` cursor/WinEvent/last-input, `advapi32` registry |
+
+Observations:
+
+- **Connection is pure managed RTSP-shaped framing.** No native boundary, so
+  the media path is entirely in the separate native wrappers. Body types have
+  only `ToString`/`Parse` members, which fits short text `key: value` bodies.
+  Enum names: `RotationDegree` (0/90/180/270) and `AutoRotationState`
+  (enable/disable). Byte layouts were not reconstructed.
+- **Display is not a virtual display driver.** It only calls documented Win32
+  APIs (`QueryDisplayConfig`, `SetDisplayConfig`, `DisplayConfigGet/SetDeviceInfo`,
+  `ChangeDisplaySettingsEx`, `EnumDisplay*`). `DisplayConfigVideoOutputTechnology`
+  includes `Miracast`, `IndirectWired`, and `IndirectVirtual`, and
+  `OrderByVideoOutputTechnology` / `SetActualVideoOutputTechnology` suggest the
+  app finds the Windows-created Miracast or indirect display target and then
+  sets its mode, scale, rotation, and position. `DisplayDeviceType` has
+  values `Tablet`, `Laptop`, `Monitor`, `Tv`, `Vst`. `Change16to10Ratio` hints
+  at 16:10 tablet modes, which the CEA table cannot express (see below).
+- **UIBC switch on Windows is a registry setting.** `UibcSettings` has
+  `EnableUibc`/`SetUibc`, `RegGetValue`/`RegSetKeyValue`, and a constant named
+  `MiracastKeySuffix`. That suggests it toggles the OS Miracast UIBC setting per
+  device rather than shipping its own UIBC stack. On Linux, UIBC has to be
+  implemented in our own WFD source.
+- **Cursor forwarding.** `MouseCursorListener` hooks WinEvents and maps the
+  system cursor to `MouseCursorType` (Arrow, IBeam, Wait, Hand, …). Together
+  with the Connection `Cursor`/`HardwareCursor` bodies, this suggests that
+  cursor shape is sent separately from the video stream.
+- **MCF roles.** `McfAdvertisementReason` = None/MainWindow/BackgroundWake/
+  NearbyConnection; `McfFailureReason` includes `BluetoothConnectionFailed`,
+  so MCF discovery depends on Bluetooth. `StartIntentRequest` has
+  `CreateNewSecondScreenRequest`, `CreateSecondScreenRequest`, and
+  `CreateLocalPcRequest`, which suggests the PC sends an intent that launches
+  the sink app on the tablet. This is still proprietary and is not
+  implemented here.
+
+### Effect on the Linux implementation
+
+Nothing above makes Samsung's private bodies necessary for a standard Miracast
+sink. `wfd/rtsp.py` now builds its capability strings only from the public
+WFD v1.0 tables: CEA bitmap and native index from width/height/fps (interlaced
+modes are never advertised; 640x480p60 is always set), and the H.264 level
+from the macroblock rate (1080p30 → 4.0, 1080p60 → 4.2). It also advertises
+LPCM 44.1/48 kHz and AAC 48 kHz stereo, answers only the keys requested in
+GET_PARAMETER, and treats an empty GET_PARAMETER as a keep-alive. 16:10 tablet
+panels would need the VESA/HH tables or WFD R2 and are left as future work.
+
 ## Evidence artifacts (local, not in git)
 
 Kept under `/workspace/segundatela-re/` on the build machine: MSIX bundle,

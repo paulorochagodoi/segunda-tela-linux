@@ -19,6 +19,119 @@ log = logging.getLogger(__name__)
 
 WFD_DEFAULT_PORT = 7236
 
+# CEA resolution/refresh table from the public Wi-Fi Display Technical
+# Specification v1.0 (Table 5-10). Index == bit position in the 32-bit
+# CEA support bitmap of wfd_video_formats.
+CEA_MODES: tuple[tuple[int, int, int, bool], ...] = (
+    (640, 480, 60, False),     # 0
+    (720, 480, 60, False),     # 1
+    (720, 480, 60, True),      # 2 (interlaced)
+    (720, 576, 50, False),     # 3
+    (720, 576, 50, True),      # 4 (interlaced)
+    (1280, 720, 30, False),    # 5
+    (1280, 720, 60, False),    # 6
+    (1920, 1080, 30, False),   # 7
+    (1920, 1080, 60, False),   # 8
+    (1920, 1080, 60, True),    # 9 (interlaced)
+    (1280, 720, 25, False),    # 10
+    (1280, 720, 50, False),    # 11
+    (1920, 1080, 25, False),   # 12
+    (1920, 1080, 50, False),   # 13
+    (1920, 1080, 50, True),    # 14 (interlaced)
+    (1280, 720, 24, False),    # 15
+    (1920, 1080, 24, False),   # 16
+)
+
+# H.264 profile / level bitmaps (WFD spec v1.0, Tables 5-11 / 5-12).
+H264_PROFILE_CBP = 0x01  # Constrained Baseline
+H264_PROFILE_CHP = 0x02  # Constrained High
+H264_LEVEL_31 = 0x01
+H264_LEVEL_32 = 0x02
+H264_LEVEL_40 = 0x04
+H264_LEVEL_41 = 0x08
+H264_LEVEL_42 = 0x10
+
+# Audio mode bitmaps (WFD spec v1.0, Tables 5-21 / 5-22).
+LPCM_44K_2CH = 0x1
+LPCM_48K_2CH = 0x2
+AAC_48K_2CH = 0x1
+
+# Keys this source can answer in a GET_PARAMETER response.
+_WFD_KEYS = (
+    "wfd_video_formats",
+    "wfd_audio_codecs",
+    "wfd_client_rtp_ports",
+    "wfd_content_protection",
+    "wfd_uibc_capability",
+    "wfd_display_edid",
+    "wfd_connector_type",
+)
+
+
+def cea_bitmap(width: int, height: int, fps: int) -> int:
+    """Progressive CEA modes that fit within width x height at <= fps."""
+    mask = 0
+    for bit, (w, h, r, interlaced) in enumerate(CEA_MODES):
+        if not interlaced and w <= width and h <= height and r <= fps:
+            mask |= 1 << bit
+    # 640x480p60 is mandatory for every WFD device.
+    return mask | 1
+
+
+def cea_native_index(width: int, height: int, fps: int) -> int:
+    """Best progressive CEA index at or below the requested mode (0 = VGA)."""
+    best, best_key = 0, (0, 0)
+    for bit, (w, h, r, interlaced) in enumerate(CEA_MODES):
+        if interlaced or w > width or h > height or r > fps:
+            continue
+        key = (w * h, r)
+        if key > best_key:
+            best, best_key = bit, key
+    return best
+
+
+def h264_level_for(width: int, height: int, fps: int) -> int:
+    """Smallest WFD H.264 level whose macroblock rate covers the mode."""
+    mbps = ((width + 15) // 16) * ((height + 15) // 16) * fps
+    # MaxMBPS per ITU-T H.264 Table A-1.
+    for level, max_mbps in (
+        (H264_LEVEL_31, 108000),
+        (H264_LEVEL_32, 216000),
+        (H264_LEVEL_40, 245760),
+        (H264_LEVEL_41, 245760),
+        (H264_LEVEL_42, 522240),
+    ):
+        if mbps <= max_mbps:
+            return level
+    return H264_LEVEL_42
+
+
+# WFD level bit -> H.264 level_idc (for SDP profile-level-id).
+_LEVEL_IDC = {H264_LEVEL_31: 31, H264_LEVEL_32: 32, H264_LEVEL_40: 40, H264_LEVEL_41: 41, H264_LEVEL_42: 42}
+
+
+def wfd_video_formats(width: int, height: int, fps: int, profile: int = H264_PROFILE_CBP) -> str:
+    """Build a WFD v1.0 wfd_video_formats value for a single H.264 codec entry.
+
+    Layout: native preferred-display-mode profile level CEA VESA HH latency
+    min-slice-size slice-enc-params frame-rate-control max-hres max-vres.
+    """
+    native = (cea_native_index(width, height, fps) << 3) | 0x0  # table 0 = CEA
+    return (
+        f"{native:02x} 00 {profile:02x} {h264_level_for(width, height, fps):02x} "
+        f"{cea_bitmap(width, height, fps):08x} 00000000 00000000 "
+        "00 0000 0000 00 none none"
+    )
+
+
+def wfd_audio_codecs() -> str:
+    return f"LPCM {LPCM_44K_2CH | LPCM_48K_2CH:08x} 00, AAC {AAC_48K_2CH:08x} 00"
+
+
+def requested_keys(body: str) -> list[str]:
+    """Parameter names listed in a GET_PARAMETER body (one per line)."""
+    return [line.strip() for line in body.splitlines() if line.strip()]
+
 
 @dataclass
 class SessionState:
@@ -115,8 +228,12 @@ class _Handler(socketserver.StreamRequestHandler):
             return
 
         if method == "GET_PARAMETER":
-            params = self._wfd_params(state)
-            self._reply(state, 200, "OK", body=params)
+            keys = requested_keys(body)
+            if not keys:
+                # Empty GET_PARAMETER is a WFD keep-alive.
+                self._reply(state, 200, "OK")
+                return
+            self._reply(state, 200, "OK", body=self._wfd_params(state, keys))
             return
 
         if method == "SET_PARAMETER":
@@ -202,23 +319,21 @@ class _Handler(socketserver.StreamRequestHandler):
 
         self._reply(state, 501, "Not Implemented")
 
-    def _wfd_params(self, state: SessionState) -> str:
-        # CEA 1920x1080p30 bitmap bit is commonly set; keep a simple profile.
-        # wfd_video_formats: <misc> <cea> <vesa> <hh> ...
-        return "\r\n".join(
-            [
-                "wfd_video_formats: 00 00 01 01 00000080 00000000 00000000 00 0000 0000 00 none none",
-                "wfd_audio_codecs: LPCM 00000002 00",
-                "wfd_client_rtp_ports: RTP/AVP/UDP;unicast 19000 0 mode=play",
-                "wfd_content_protection: none",
-                "wfd_uibc_capability: none",
-                "wfd_display_edid: none",
-                "wfd_connector_type: 05",
-                "",
-            ]
-        )
+    def _wfd_params(self, state: SessionState, keys: Optional[list[str]] = None) -> str:
+        values = {
+            "wfd_video_formats": wfd_video_formats(state.width, state.height, state.fps),
+            "wfd_audio_codecs": wfd_audio_codecs(),
+            "wfd_client_rtp_ports": f"RTP/AVP/UDP;unicast {state.rtp_port} 0 mode=play",
+            "wfd_content_protection": "none",
+            "wfd_uibc_capability": "none",
+            "wfd_display_edid": "none",
+            "wfd_connector_type": "05",  # HDMI
+        }
+        lines = [f"{k}: {values[k]}" for k in (keys or _WFD_KEYS) if k in values]
+        return "\r\n".join(lines + [""])
 
     def _sdp(self, state: SessionState) -> str:
+        level_idc = _LEVEL_IDC[h264_level_for(state.width, state.height, state.fps)]
         return "\r\n".join(
             [
                 "v=0",
@@ -228,7 +343,7 @@ class _Handler(socketserver.StreamRequestHandler):
                 "t=0 0",
                 "m=video 0 RTP/AVP 96",
                 "a=rtpmap:96 H264/90000",
-                "a=fmtp:96 profile-level-id=42e01f",
+                f"a=fmtp:96 profile-level-id=42e0{level_idc:02x}",
                 "",
             ]
         )
