@@ -1,3 +1,3 @@
 # Segunda Tela para Linux
 
-Este arquivo espelha a seção em português do [README.md](README.md).
+Ver a seção em português em [README.md](README.md), incluindo **Modo USB**.

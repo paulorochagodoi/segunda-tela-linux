@@ -11,5 +11,6 @@ apt-get install -y \
   gstreamer1.0-libav gstreamer1.0-pipewire \
   pipewire pipewire-pulse wireplumber \
   network-manager \
+  android-tools-adb \
   build-essential dkms linux-headers-$(uname -r) || true
 echo "Base deps installed. Optional real virtual monitor: scripts/install-evdi.sh"

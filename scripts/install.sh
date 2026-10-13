@@ -18,3 +18,5 @@ Categories=Utility;Network;
 Keywords=miracast;second;screen;tablet;
 DESK
 echo "Installed. Run: segunda-tela   or   segunda-tela --ui"
+
+echo "Opcional USB: sudo $ROOT/scripts/install-udev-samsung.sh"

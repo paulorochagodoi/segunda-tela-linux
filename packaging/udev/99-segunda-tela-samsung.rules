@@ -1,0 +1,10 @@
+# Segunda Tela para Linux — Samsung USB (VID 04e8)
+# Install: sudo cp packaging/udev/99-segunda-tela-samsung.rules /etc/udev/rules.d/
+#          sudo udevadm control --reload-rules && sudo udevadm trigger
+#
+# TAG+="uaccess" lets the logged-in seat talk to the device without being root.
+# We do not load proprietary drivers; kernel rndis_host/cdc_ncm/cdc_ether handle tether.
+
+SUBSYSTEM=="usb", ATTR{idVendor}=="04e8", MODE="0660", TAG+="uaccess", ENV{SEGUNDA_TELA_SAMSUNG}="1"
+SUBSYSTEM=="usb", ATTR{idVendor}=="04e8", ATTR{idProduct}=="6860", ENV{SEGUNDA_TELA_PID}="6860"
+SUBSYSTEM=="net", ACTION=="add", DRIVERS=="rndis_host|cdc_ncm|cdc_ether", ENV{ID_VENDOR_ID}=="04e8", ENV{SEGUNDA_TELA_USB_NET}="1"

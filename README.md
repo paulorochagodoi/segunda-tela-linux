@@ -19,7 +19,8 @@ como segunda tela no **Pop!_OS** e outros desktops Linux, via **Wi-Fi Display
 | Monitor virtual real (EVDI) | Script opcional; não obrigatório |
 | Pareamento MCF “Second Screen” one-tap da Samsung | **Não** — ver [docs/SAMSUNG_MCF.md](docs/SAMSUNG_MCF.md) |
 | Teste em Galaxy Tab real | **Não testado** (sem hardware neste ambiente) |
-| UIBC / S Pen | Não implementado (v0.1) |
+| USB cabo (tether/adb → WFD) | Implementado (sem Connlib) |
+| UIBC / S Pen | Não implementado |
 
 ## Requisitos
 
@@ -50,6 +51,20 @@ No tablet: abra **Smart View** / projeção sem fio e escolha o PC, ou use um si
 WFD apontando para `rtsp://<IP-do-PC>:7236`. PC e tablet na mesma rede (ou P2P
 quando o driver permitir).
 
+
+### Modo USB (cabo)
+
+```bash
+sudo ./scripts/install-udev-samsung.sh
+# No tablet: Tethering USB (ou depuração USB / adb)
+segunda-tela --usb
+segunda-tela usb --prefer-adb
+```
+
+O app Windows usa Connlib proprietário para obter IP+porta no cabo e então
+RTSP/RTP. Aqui: **tether RNDIS/NCM ou adb reverse**, depois o mesmo source WFD.
+Detalhes e limites: [docs/USB.md](docs/USB.md).
+
 ## Análise do app Windows
 
 O app da Store `Segunda tela` (9PLTXW5DX5KB) foi inspecionado com
@@ -77,5 +92,17 @@ sudo ./scripts/install-deps-popos.sh && ./scripts/install.sh
 segunda-tela --loopback-test
 segunda-tela
 ```
+
+
+### USB cable mode
+
+```bash
+sudo ./scripts/install-udev-samsung.sh
+segunda-tela --usb
+```
+
+Windows uses proprietary Connlib for IP+ports over USB, then RTSP/RTP. We use
+**RNDIS/NCM tethering or adb reverse**, then the same open WFD source. See
+[docs/USB.md](docs/USB.md).
 
 Protocol research notes: [docs/FINDINGS.md](docs/FINDINGS.md). License: MIT.

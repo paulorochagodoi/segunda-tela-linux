@@ -81,7 +81,7 @@ EVDI DKMS), **not** a from-scratch kernel driver.
 | Virtual monitor (extend mode) | Yes | PipeWire / xdg-desktop-portal RemoteDesktop+Screencast; optional EVDI; X11 dummy sink |
 | Tablet "Second Screen" one-tap via MCF | **Blocked / incomplete** | Requires Samsung MCF stack, app IDs, and likely account/device attestation — not available as open source |
 | UIBC touch / S Pen | Partial | Standard WFD UIBC if sink exposes it; Samsung extensions unknown |
-| USB second screen | Out of scope for v1 | Would need separate USB protocol RE |
+| USB second screen | Partial (v0.2) | See below + `docs/USB.md`: tether/adb IP then open WFD; Connlib not cloned |
 | Samsung trademarks / UI clone | No | Independent name and UI |
 
 ## Limitations & ethics
@@ -155,3 +155,21 @@ panels would need the VESA/HH tables or WFD R2 and are left as future work.
 Kept under `/workspace/segundatela-re/` on the build machine: MSIX bundle,
 extracted x64 package, REA JSON inventories, string dumps. SHA-256 of the
 bundle can be regenerated from the Store CDN; do not commit binaries.
+
+
+## USB path (wired)
+
+Evidence (`Samsung.SecondScreen.Usb`, P/Invoke to `ss_conn_lib2.dll`, strings):
+
+- Device filter: `USB\VID_04E8&PID_6860\…` (Samsung vendor `04e8`).
+- Native stack symbols: `ConnlibStartup`, `ConnlibDeviceOpen`,
+  `ConnlibConnectionOpen`, **`ConnlibConnectionGetIpAddr`**,
+  **`ConnlibConnectionGetPort`**.
+- Managed follow-up: `OpenTcpClient` / `OpenTcpServer` / `OpenUdpClient` with
+  fields/ports named `RtspPort`, `RtpPort`, `UibcPort`, `HdcpPort`, etc.
+- MTP (`UsbMtp`) uploads a config file; not the H.264 transport.
+- Failure string: `Failed to open USB. Projecting over Wi-Fi Direct instead.`
+
+**Linux clean-room mirror:** obtain an IP interface via RNDIS/NCM tether or adb,
+then run the same open WFD RTSP source. Do **not** ship Connlib. Details:
+[`docs/USB.md`](USB.md).
