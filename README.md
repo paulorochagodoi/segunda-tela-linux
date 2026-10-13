@@ -22,7 +22,7 @@ como **segunda tela estendida** no **Pop!_OS** e outros desktops Linux, via
 | **Estender**: monitor virtual EVDI com EDID próprio (1920x1200, 2560x1600, 1080p) | Implementado · **não testado em hardware** |
 | Captura só do monitor virtual: portal ScreenCast (COSMIC) ou leitura direta do EVDI | Implementado · **não testado em hardware** |
 | Espelhar (`--mode mirror`) via portal / X11 | Implementado |
-| USB cabo: tether/adb → PC **inicia** a sessão (abre o receptor via adb, acha a porta do sink, disca M1–M7) | Implementado (sem Connlib) · testado contra sink simulado · **não testado em hardware** |
+| USB cabo: adb como túnel de portas (no lugar do Connlib) → *source ready* MS-MICE na :7250 do tablet, tablet conecta de volta na :7236; RTP pelo tether | Implementado · testado contra tablet simulado · **não testado em hardware** |
 | Pareamento MCF “Second Screen” one-tap da Samsung | **Não** — ver [docs/SAMSUNG_MCF.md](docs/SAMSUNG_MCF.md) |
 | UIBC / toque / S Pen | Não implementado |
 
@@ -96,16 +96,16 @@ segunda-tela -v --usb --mode extend   # mesmo caminho EVDI (estender) do Wi-Fi
 segunda-tela usb --prefer-adb
 ```
 
-No cabo **o PC toma a iniciativa** (nada no tablet disca para o PC sozinho):
-via adb faz `adb reverse tcp:7236`, procura e abre apps/atividades/blocos do
-painel rápido com cara de receptor, lê as portas TCP em escuta no tablet e
-**conecta no sink** (pelo IP do tether ou por `adb forward`) rodando M1→M7
-como source. O vídeo (RTP/UDP) vai para o IP do tablet no tether. Se nada
-aceitar, o programa diz exatamente o que fazer.
-
-O app Windows usa Connlib proprietário para obter IP+porta no cabo; a
-“Segunda tela” Samsung **por cabo** depende dele e provavelmente **não**
-funciona aqui — use Wi-Fi Direct (`--device`). Detalhes: [docs/USB.md](docs/USB.md).
+O app do Windows, no cabo, roda **WFD/RTSP comum** dentro de um túnel de
+portas USB (Connlib): o PC manda um *source ready* (MS-MICE) para a porta
+7250 do tablet e o tablet conecta de volta na 7236 do PC. Aqui o adb faz o
+papel do túnel: `adb reverse tcp:7236`, grava a config de cabo
+(`{"USB":1}`) do app `com.samsung.android.secondscreen`, abre o app,
+envia o *source ready* por `adb forward` e espera o tablet conectar. O vídeo
+(RTP/UDP) vai pelo IP do tether. O app do tablet normalmente é acordado por
+Bluetooth (MCF), que não reproduzimos — abra a “Segunda tela” no painel
+rápido antes. Se não atender, use Wi-Fi Direct (`--device`). Detalhes:
+[docs/USB.md](docs/USB.md).
 
 ## Análise do app Windows
 
@@ -161,14 +161,16 @@ VAAPI) are **untested in CI**; the RTSP/WFD exchange is covered by a loopback
 test against a simulated sink, and the media pipeline was validated by
 encoding and decoding locally.
 
-USB cable mode (0.3.1): with `--usb` the PC now *initiates*. Over adb (if
-authorized) it sets `adb reverse tcp:7236`, tries to open receiver-looking
-apps/activities/quick-settings tiles, reads the tablet's listening TCP ports,
-then dials the sink (tether IP or `adb forward`) and runs the source M1–M7 on
-that socket; RTP goes to the tablet's tether IP. Extend uses the same EVDI path
-as Wi-Fi. If nothing on the tablet accepts, it prints concrete next steps —
-Samsung's cable "Second Screen" needs the proprietary Connlib, so Wi-Fi Direct
-(`--device`) is the supported route. `segunda-tela doctor` has a USB section
+USB cable mode (0.3.2): reverse engineering showed that Samsung's cable mode
+is plain WFD/RTSP inside a per-port USB tunnel (Connlib). The PC sends an
+MS-MICE SOURCE_READY to the tablet's port 7250, and the tablet connects back
+to the PC's RTSP port 7236. With `--usb` we use adb as the tunnel
+(`adb reverse tcp:7236`, `adb forward` → 7250). We also write the receiver's
+cable config (`com.samsung.android.secondscreen`), open the app, send
+SOURCE_READY, and fall back to dialling any RTSP sink port. RTP goes over the
+tether IP. The tablet app is normally woken over Bluetooth (MCF), which we
+don't reproduce, so open "Second screen" on the tablet first; Wi-Fi Direct
+(`--device`) remains the fallback. `segunda-tela doctor` has a USB section
 (adb, authorization, tether iface/IP, peer reachability, ports). Details:
 [docs/USB.md](docs/USB.md). Samsung's MCF one-tap pairing is out of scope.
 

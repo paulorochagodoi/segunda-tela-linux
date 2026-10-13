@@ -1,26 +1,21 @@
 """Bring up an IP path to a Galaxy Tab over USB, then reuse WFD/RTSP.
 
-Clean-room mirror of the Windows behaviour observed via REA:
+Clean-room mirror of the Windows behaviour observed via REA (docs/USB.md):
 
-- Samsung's stack (`ss_conn_lib2` / Connlib*) opens a USB device and exposes
-  **IP address + TCP/UDP ports** (`ConnlibConnectionGetIpAddr`,
-  `ConnlibConnectionGetPort`, then `OpenTcpClient` / `OpenTcpServer` with
-  `RtspPort` / `RtpPort` / `UibcPort`).
-- Device filter evidence: `USB\\VID_04E8&PID_6860\\…`
-- MTP is used as a side channel for a config file, not as the video transport.
+- Samsung's Connlib (`ss_conn_lib2` + the `ss_conn_service2` driver service)
+  is a per-port TCP/UDP tunnel over the USB bulk endpoints of
+  `USB\\VID_04E8&PID_6860`; on top of it runs ordinary WFD/RTSP from
+  Windows' own Miracast source (RTSP 7236, source-ready 7250, RTP 19000).
+- MTP is only a side channel for the receiver's cable-mode config file.
 - On USB failure Windows falls back to Wi-Fi Direct.
 
-We do **not** reimplement Connlib. On Linux we use standard mechanisms that
-also yield an IP link to the tablet:
+We do **not** reimplement Connlib. On Linux we use standard mechanisms:
 
-1. USB tethering (RNDIS / NCM / CDC) via NetworkManager when the user enables
-   "USB tethering" / modem mode on the tablet.
-2. Optional `adb reverse` / `adb forward` when `adb` sees the device.
+1. USB tethering (RNDIS / NCM / CDC) via NetworkManager — needed for RTP/UDP.
+2. `adb reverse` / `adb forward` as the TCP port tunnel (usb/initiate.py).
 
-The existing WFD RTSP source then advertises/binds on that link. If the
-tablet's "Second Screen" USB sink only speaks Connlib, it will not connect —
-document that honestly and prefer Smart View / a WFD sink over the tether IP,
-or Wi-Fi mode.
+The existing WFD RTSP source then binds on that link; `UsbInitiator` performs
+the source-ready handshake. Wi-Fi mode stays the fallback.
 """
 from __future__ import annotations
 

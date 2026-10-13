@@ -1,18 +1,20 @@
 """USB mode: make the PC *initiate* the WFD session instead of only listening.
 
-Over a tether nothing on a Galaxy Tab dials a Linux PC by itself, so after the
-IP link is up we:
+Samsung's own cable mode (docs/USB.md) is WFD/RTSP through a per-port USB
+tunnel: the PC sends an MS-MICE SOURCE_READY to the tablet's port 7250 and the
+tablet connects back to the PC's RTSP port 7236. We reproduce that with adb as
+the tunnel:
 
-1. (adb, if authorized) `adb reverse tcp:7236` so a sink on the tablet can reach
-   us at 127.0.0.1:7236; look for receiver/"second screen" packages, activities
-   and quick-settings tiles and try to open them; read the tablet's LISTEN
-   sockets (/proc/net/tcp*) to find a WFD sink RTSP port.
-2. Dial each candidate sink port — over the tether IP, or through
-   `adb forward` — and run the source M1–M7 flow on that socket
-   (`WfdRtspServer.connect_to`). RTP still goes to the tether peer IP.
-3. If nothing accepts, print exactly what to do on the tablet (or that the
-   Samsung cable path needs the proprietary Connlib and Wi-Fi Direct should be
-   used instead).
+1. (adb, if authorized) `adb reverse tcp:7236` so the tablet reaches our RTSP
+   source at 127.0.0.1:7236; find the Second Screen package
+   (com.samsung.android.secondscreen, legacy …smartmirroring), write its
+   `files/config/secondscreen.data` cable flag, open its UI; read the tablet's
+   LISTEN sockets (/proc/net/tcp*).
+2. SOURCE_READY to tablet:7250 — through `adb forward` and/or the tether IP —
+   then wait for the RTSP connect-back (inbound session).
+3. Fallback for generic sinks: dial a listening RTSP port and run M1–M7 on that
+   socket (`WfdRtspServer.connect_to`). RTP always goes to the tether peer IP.
+4. If nothing works, print exactly what to do on the tablet.
 
 Every attempt and its outcome is reported through `say()`.
 """
@@ -21,6 +23,7 @@ from __future__ import annotations
 import errno
 import logging
 import socket
+import uuid
 import threading
 import time
 from dataclasses import dataclass, field
@@ -28,6 +31,7 @@ from typing import Callable, Optional
 
 from .adb import WFD_PORTS, Adb, Listener, parse_dumpsys_activities, parse_qs_tiles, same_subnet, sink_packages
 from .link import UsbLink
+from .samsung import SOURCE_READY_PORT, config_path, config_json, installed_hosts, mice_source_ready
 
 log = logging.getLogger(__name__)
 
@@ -63,7 +67,7 @@ def probe_tcp(host: str, port: int, timeout: float = 1.5) -> str:
 class Target:
     host: str
     port: int
-    via: str  # "tether" | "adb-forward"
+    via: str  # "tether" | "adb-forward" (…→tablet:N once allocated)
     media_host: str = ""
 
     def __str__(self) -> str:
@@ -77,14 +81,17 @@ class InitiateResult:
     listeners: list[Listener] = field(default_factory=list)
     sink_pkgs: list[str] = field(default_factory=list)
     source_pkgs: list[str] = field(default_factory=list)
+    hosts: list[str] = field(default_factory=list)  # Samsung Second Screen packages installed
+    configured: list[str] = field(default_factory=list)  # packages whose cable flag we wrote
     launched: list[str] = field(default_factory=list)
     attempts: list[str] = field(default_factory=list)
 
 
 def pick_sink_ports(listeners: list[Listener], sink_uids: set[int]) -> list[Listener]:
-    """Tablet LISTEN sockets worth dialling: WFD ports first, then ports owned by sink apps."""
+    """Tablet LISTEN sockets worth dialling with RTSP: WFD ports first, then ports owned by sink apps."""
     wfd = [l for l in listeners if l.port in WFD_PORTS]
-    owned = [l for l in listeners if l.uid in sink_uids and l.port not in WFD_PORTS and l.port >= 1024]
+    owned = [l for l in listeners if l.uid in sink_uids and l.port not in WFD_PORTS
+             and l.port != SOURCE_READY_PORT and l.port >= 1024]
     wfd.sort(key=lambda l: WFD_PORTS.index(l.port))
     return wfd + sorted(owned, key=lambda l: l.port)
 
@@ -104,6 +111,17 @@ def build_targets(peer_ip: str, listeners: list[Listener], adb_ok: bool) -> list
     return targets
 
 
+def source_ready_targets(peer_ip: str, listeners: list[Listener], adb_ok: bool) -> list[Target]:
+    """Where to send SOURCE_READY (pure). Unknown listeners → try both paths blind."""
+    lis = next((l for l in listeners if l.port == SOURCE_READY_PORT), None)
+    targets: list[Target] = []
+    if adb_ok and (lis is None or lis.wildcard or lis.loopback_only):
+        targets.append(Target("127.0.0.1", SOURCE_READY_PORT, "adb-forward", media_host=peer_ip))
+    if peer_ip and (lis is None or lis.wildcard or lis.addr == peer_ip):
+        targets.append(Target(peer_ip, SOURCE_READY_PORT, "tether"))
+    return targets
+
+
 def guidance(link: UsbLink, res: InitiateResult, rtsp_port: int) -> str:
     """Actionable text for when no sink could be reached over the cable."""
     lines = ["Nenhum receptor WFD/Miracast no tablet aceitou conexão pelo cabo USB."]
@@ -115,27 +133,32 @@ def guidance(link: UsbLink, res: InitiateResult, rtsp_port: int) -> str:
     elif res.adb_state == "unauthorized":
         lines.append("• adb: tablet NÃO autorizado — desbloqueie a tela e aceite “Permitir depuração USB”.")
     if res.adb_state == "device":
+        if res.hosts:
+            lines.append("• Segunda tela Samsung no tablet: " + ", ".join(res.hosts)
+                         + (" (config USB gravada)" if res.configured else " (não consegui gravar a config USB)"))
+        else:
+            lines.append("• Pacote da Segunda tela (com.samsung.android.secondscreen / …smartmirroring) "
+                         "não encontrado no tablet.")
         if res.sink_pkgs:
             lines.append("• Apps receptores encontrados: " + ", ".join(res.sink_pkgs)
                          + (" (abertos: " + ", ".join(res.launched) + ")" if res.launched else ""))
         else:
             lines.append("• Nenhum app receptor (sink) Miracast/WFD instalado no tablet.")
-        if res.source_pkgs:
-            lines.append("  (" + ", ".join(res.source_pkgs) + " é Smart View: transmite DO tablet, não recebe.)")
         if res.listeners:
             lines.append("• Portas TCP abertas por apps receptores: "
                          + ", ".join(f"{l.addr}:{l.port}" for l in res.listeners) + " — nenhuma falou WFD.")
     lines += [
         "",
         "O que fazer:",
-        "1. A “Segunda tela” da Samsung por cabo usa o protocolo proprietário Connlib (só o app do "
-        "Windows). Pelo USB isso NÃO é possível com este projeto.",
-        "2. Use Wi-Fi Direct (mesmo receptor, protocolo aberto): no tablet abra o painel rápido → "
-        "“Segunda tela” e deixe na tela de espera; no PC:",
+        "1. No Windows a “Segunda tela” por cabo é WFD/RTSP num túnel de portas USB (Connlib): o PC "
+        f"manda “source ready” para a porta {SOURCE_READY_PORT} do tablet e o tablet conecta de volta "
+        f"na {rtsp_port}. Aqui o túnel é o adb, mas quem acorda o app no tablet é uma mensagem "
+        "Bluetooth (MCF) que só o app do Windows envia — então abra a “Segunda tela” no painel rápido "
+        "do tablet e deixe na tela de espera; o PC segue tentando.",
+        "2. Se o tablet não atender pelo cabo, use Wi-Fi Direct (mesmo receptor, protocolo aberto):",
         "     segunda-tela list",
         "     segunda-tela --mode extend --device \"<nome do tablet>\"",
-        f"3. Se você tiver um app receptor Miracast/RTSP aberto no tablet, aponte-o para "
-        f"rtsp://{link.local_ip or '?'}:{rtsp_port}"
+        f"3. Um app receptor Miracast/RTSP no tablet pode apontar para rtsp://{link.local_ip or '?'}:{rtsp_port}"
         + (f" (ou rtsp://127.0.0.1:{rtsp_port} — adb reverse ativo)" if res.adb_state == "device" else "")
         + " — o PC continua escutando.",
     ]
@@ -158,6 +181,7 @@ class UsbInitiator:
         say: Callable[[str], None] = print,
         dial: Callable[[str, int, float], "tuple[Optional[socket.socket], str]"] = dial_tcp,
         settle_s: float = SESSION_SETTLE_S,
+        friendly_name: Optional[str] = None,
     ) -> None:
         self.server = server
         self.link = link
@@ -170,6 +194,8 @@ class UsbInitiator:
         self.say = say
         self.dial = dial
         self.settle_s = settle_s
+        self.friendly_name = friendly_name or socket.gethostname() or "Linux"
+        self.source_id = uuid.uuid4().bytes
         self.result = InitiateResult()
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
@@ -177,6 +203,7 @@ class UsbInitiator:
         self._last_probe: dict[str, str] = {}
         self._reversed = False
         self._sink_uids: set[int] = set()
+        self._mice_socks: list[socket.socket] = []
 
     # ------------------------------------------------------------ lifecycle
     def start(self) -> None:
@@ -190,6 +217,12 @@ class UsbInitiator:
         for lp in self._forwards.values():
             self.adb.remove_forward(lp)
         self._forwards.clear()
+        for sk in self._mice_socks:
+            try:
+                sk.close()
+            except OSError:
+                pass
+        self._mice_socks.clear()
         if self._reversed and not self.link._adb_reversed:
             self.adb.remove_reverse(self.rtsp_port)
             self._reversed = False
@@ -230,9 +263,21 @@ class UsbInitiator:
 
         pkgs = self.adb.packages()
         res.sink_pkgs, res.source_pkgs = sink_packages(pkgs)
-        self._sink_uids = {pkgs[p] for p in res.sink_pkgs if pkgs.get(p, -1) >= 0}
-        self._note("apps receptores no tablet: " + (", ".join(res.sink_pkgs) or "nenhum")
-                   + (f"; Smart View/espelhamento (source): {', '.join(res.source_pkgs)}" if res.source_pkgs else ""))
+        res.hosts = installed_hosts(pkgs)
+        self._sink_uids = {pkgs[p] for p in res.sink_pkgs + res.hosts if pkgs.get(p, -1) >= 0}
+        self._note("Segunda tela Samsung: " + (", ".join(res.hosts) or "não instalada")
+                   + "; outros receptores: " + (", ".join(p for p in res.sink_pkgs if p not in res.hosts) or "nenhum"))
+
+    def configure_hosts(self) -> None:
+        """Write the cable flag the Windows app pushes over MTP (files/config/secondscreen.data)."""
+        if self.result.adb_state != "device" or not self.launch:
+            return
+        for pkg in self.result.hosts:
+            path = config_path(pkg)
+            ok = self.adb.write_file(path, config_json(usb=True))
+            self._note(f"config USB {path} → {'gravada' if ok else 'falhou (sem permissão no Android/data?)'}")
+            if ok:
+                self.result.configured.append(pkg)
 
     def launch_sink(self) -> None:
         if self.result.adb_state != "device" or not self.launch:
@@ -240,7 +285,8 @@ class UsbInitiator:
         comps: list[str] = []
         if self.sink_activity:
             comps.append(self.sink_activity)
-        for pkg in self.result.sink_pkgs:
+        pkgs = self.result.hosts + [p for p in self.result.sink_pkgs if p not in self.result.hosts]
+        for pkg in pkgs:
             rc, out = self.adb.shell(f"dumpsys package {pkg}", timeout=15)
             comps += [c for c in parse_dumpsys_activities(out, pkg) if c not in comps]
         for comp in comps:
@@ -250,7 +296,8 @@ class UsbInitiator:
             if ok:
                 self.result.launched.append(comp)
                 return
-        for pkg in self.result.sink_pkgs:
+        # Not the legacy smartmirroring host: its launcher is Smart View (casts *from* the tablet).
+        for pkg in [p for p in pkgs if p not in self.result.source_pkgs]:
             rc, out = self.adb.shell(f"monkey -p {pkg} -c android.intent.category.LAUNCHER 1")
             ok = rc == 0 and "No activities found" not in out and "aborted" not in out.lower()
             self._note(f"abrir launcher de {pkg} → {'ok' if ok else 'sem atividade de launcher'}")
@@ -264,7 +311,7 @@ class UsbInitiator:
             if rc == 0:
                 self.result.launched.append(tile)
                 return
-        if not comps and not self.result.sink_pkgs:
+        if not comps and not pkgs:
             self._note("nada para abrir no tablet (nenhum receptor encontrado)")
 
     def discover_listeners(self) -> list[Listener]:
@@ -277,16 +324,56 @@ class UsbInitiator:
                        + (", ".join(f"{l.addr}:{l.port} (uid {l.uid})" for l in found) or "nenhuma escutando"))
         return found
 
+    def _resolve_forward(self, t: Target) -> Optional[Target]:
+        if t.via != "adb-forward":
+            return t
+        lp = self._forwards.get(t.port) or self.adb.forward(t.port)
+        if lp is None:
+            self._note(f"adb forward → tablet:{t.port} falhou")
+            return None
+        self._forwards[t.port] = lp
+        if not t.media_host:
+            self._note("AVISO: sem IP de tether, o RTP (UDP) não passa pelo adb; ative Tethering USB")
+        return Target("127.0.0.1", lp, f"adb-forward→tablet:{t.port}", t.media_host)
+
+    def send_source_ready(self, t: Target) -> bool:
+        """MS-MICE SOURCE_READY to tablet:7250, then wait for the RTSP connect-back."""
+        r = self._resolve_forward(t)
+        if r is None:
+            return False
+        sock, state = self.dial(r.host, r.port, 1.5)
+        if sock is None:
+            if self._last_probe.get(str(r)) != state:
+                self._last_probe[str(r)] = state
+                self._note(f"source-ready {r} → {state}")
+            return False
+        try:
+            sock.sendall(mice_source_ready(self.friendly_name, self.rtsp_port, self.source_id))
+        except OSError as exc:
+            sock.close()
+            self._note(f"source-ready {r} → envio falhou: {exc}")
+            return False
+        self._mice_socks.append(sock)  # keep it open while the sink connects back
+        if self._last_probe.get(str(r)) != "sent":
+            self._last_probe[str(r)] = "sent"
+            self._note(f"source-ready enviado para {r} (“{self.friendly_name}”, RTSP :{self.rtsp_port}); "
+                       f"aguardando o tablet conectar de volta")
+        deadline = time.monotonic() + self.settle_s
+        while not self._stop.is_set() and time.monotonic() < deadline:
+            if self.server.active_sessions:
+                self._note(f"tablet conectou no RTSP :{self.rtsp_port} após source-ready ({r})")
+                self.result.connected = r
+                return True
+            self._stop.wait(0.1)
+        self._mice_socks.remove(sock)
+        sock.close()
+        return False
+
     def try_target(self, t: Target) -> bool:
-        if t.via == "adb-forward":
-            lp = self._forwards.get(t.port) or self.adb.forward(t.port)
-            if lp is None:
-                self._note(f"adb forward → tablet:{t.port} falhou")
-                return False
-            self._forwards[t.port] = lp
-            t = Target("127.0.0.1", lp, f"adb-forward→tablet:{t.port}", t.media_host)
-            if not t.media_host:
-                self._note("AVISO: sem IP de tether, o RTP (UDP) não passa pelo adb; ative Tethering USB")
+        r = self._resolve_forward(t)
+        if r is None:
+            return False
+        t = r
         # Dial once and hand that very socket to the RTSP source: some sinks accept
         # a single connection, so a separate "probe" connect would burn it.
         sock, state = self.dial(t.host, t.port, 1.5)
@@ -319,6 +406,10 @@ class UsbInitiator:
         link = self.link
         self._note(f"iniciando conexão ativa ao tablet (peer {link.peer_ip or '?'}, até {self.timeout_s:.0f}s)")
         self.setup_adb()
+        if link.peer_ip and link.transport != "adb-reverse":
+            # Sinks that come in through `adb reverse` look like 127.0.0.1; RTP goes to the tether IP.
+            self.server.loopback_media_host = link.peer_ip
+        self.configure_hosts()
         self.launch_sink()
         deadline = time.monotonic() + self.timeout_s
         hinted = False
@@ -328,7 +419,13 @@ class UsbInitiator:
                 return self.result
             listeners = self.discover_listeners()
             peer = link.peer_ip if link.transport != "adb-reverse" else ""
-            for t in build_targets(peer, listeners, self.result.adb_state == "device"):
+            adb_ok = self.result.adb_state == "device"
+            for t in source_ready_targets(peer, listeners, adb_ok):
+                if self._stop.is_set():
+                    break
+                if self.send_source_ready(t):
+                    return self.result
+            for t in build_targets(peer, listeners, adb_ok):
                 if self._stop.is_set():
                     break
                 if self.try_target(t):

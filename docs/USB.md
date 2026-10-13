@@ -1,102 +1,135 @@
 # USB cable mode
 
-## What the Windows app does (evidence)
+## What the Windows app does (verified with REA, 1.16.7.0)
 
-From REA inventories / strings on `Samsung.SecondScreen.Usb` + `ss_conn_lib2.dll`
-(see `docs/FINDINGS.md`):
+Clean-room summary. The analysis used metadata, constants, call edges and IL
+read-through of `Samsung.SecondScreen.Usb`, `Samsung.SecondScreen` (projection),
+`Samsung.SecondScreen.MCF` and `Samsung.SecondScreen.Device`, plus strings from
+`ss_conn_lib2.dll`. No Samsung code was copied. The full notes are kept outside
+the repo.
 
-1. Match Samsung USB: `VID_04E8` (e.g. `PID_6860` in the Windows AQS filter).
-2. Open a proprietary **Connlib** stack (`ConnlibStartup` → `DeviceOpen` →
-   `ConnectionOpen`) which exposes **`ConnlibConnectionGetIpAddr`** and
-   **`ConnlibConnectionGetPort`**.
-3. Open **TCP/UDP** sockets (`OpenTcpClient` / `OpenTcpServer` / `OpenUdpClient`)
-   using named ports `RtspPort`, `RtpPort`, `RtcpPort`, `UibcPort`, etc.
-4. Optional **MTP** side channel (`UsbMtp`) to push a small config file — not the
-   video bitstream.
-5. On failure: *"Failed to open USB. Projecting over Wi-Fi Direct instead."*
+### 1. Protocol: WFD/RTSP inside a port tunnel
 
-So the wired path is still **IP + RTSP/RTP**, not raw isochronous USB video.
-Connlib itself is closed-source; we do not redistribute or reimplement it.
+The cable mode is **not** a separate proprietary display protocol. The
+projection code uses one path for cable and Wi-Fi: it opens USB, then calls
+Windows' own Miracast source (`StartProjectingAsync` on the tablet's Miracast
+device). If USB can't be opened it logs *"Failed to open USB. Projecting over
+Wi-Fi Direct instead."* and pairs over Wi-Fi Direct.
+
+**Connlib** (`ss_conn_lib2.dll` plus the `ss_conn_service2` service from
+Samsung's USB driver) is only a **per-port TCP/UDP tunnel** over the USB bulk
+endpoints of `VID_04E8&PID_6860`. No RNDIS/NCM network or USB tethering is
+involved. Its API opens one mapping per {listen|connect|bidirectional, IPv4,
+TCP|UDP, port}. When Windows has no network profile at all, the app installs a
+loopback network adapter so the Miracast stack has an interface to use.
+
+### 2. Ports and handshake
+
+The app opens these mappings. "PC listens" means the tablet connects to the PC
+through the tunnel.
+
+| Port  | Proto | Name in app        | PC role       | Required |
+|-------|-------|--------------------|---------------|----------|
+| 7260  | TCP   | CustomPort         | listens (Samsung side channel: rotation, cursor, screensaver… in RTSP-style messages) | yes |
+| 7250  | TCP   | **SourceReadyPort**| **connects**  | yes |
+| 7236  | TCP   | RtspPort           | **listens** (RTSP server, sends M1) | yes |
+| 19000 | UDP   | RtpPort            | sends         | yes |
+| 19001 | UDP   | RtcpPort           | sends         | yes |
+| 50000 | TCP   | UibcPort           | listens       | best effort |
+| 50001/50002 | UDP | hardware cursor | sends        | best effort |
+| 25030 | TCP   | HdcpPort           | connects      | best effort |
+
+The roles match Microsoft's public **Miracast over Infrastructure (MS-MICE)**
+model:
+
+1. The PC connects to the tablet's **7250** and sends **SOURCE_READY**
+   (friendly name, RTSP port, source ID).
+2. The tablet connects back to the PC's **7236**. The PC sends M1 and the
+   normal WFD M1–M7 exchange follows.
+3. H.264/MPEG-TS over RTP goes PC → tablet on UDP **19000** (RTCP 19001).
+
+So **the PC does not send RTSP to the tablet**. It sends SOURCE_READY and
+waits for the tablet to connect back.
+
+### 3. How the tablet receiver is started
+
+There is no adb usage, no broadcast and no mDNS anywhere in the USB path.
+
+- **MCF start intent over Bluetooth.** The PC sends an MCF "simple message"
+  (app id 34) to the package **`com.samsung.android.secondscreen`** with
+  action `com.samsung.android.secondscreen.mcf.message`. On older One UI it
+  goes instead to the legacy host **`com.samsung.android.smartmirroring`**
+  with action `….smartmirroring.mcf.message`. The message is `start` or
+  `stop`, and its extra data includes the PC's MCF/device id, name, type
+  (PC) and a **`USB` flag**. The protocol is proprietary and travels over
+  Bluetooth, so we don't reproduce it.
+- **MTP config file.** When the tablet appears as an MTP device, the app
+  writes `secondscreen.data` into `Android/data/<package>/files/config/`. It
+  tries the new package first, then the legacy one. The file is a one-field
+  JSON object, `USB` = 1|0. The app also reads the MTP vendor extension
+  `samsung.com/devicestatus`.
+- `com.samsung.android.mirroringplayer` belongs to a different feature
+  ("local PC" mirroring).
 
 ## What Linux does (`--usb` / `segunda-tela usb`)
+
+adb plays Connlib's role: `adb reverse` for the ports the PC listens on and
+`adb forward` for the ports the PC dials. adb cannot carry UDP, so RTP needs
+**USB tethering** as well.
 
 | Step | Mechanism |
 |------|-----------|
 | Detect tablet | sysfs `idVendor=04e8` (+ udev rule `packaging/udev/99-segunda-tela-samsung.rules`) |
-| IP link (preferred) | USB tethering → kernel `rndis_host` / `cdc_ncm` / `cdc_ether` + NetworkManager |
-| IP link (alternate) | `adb reverse tcp:7236` if USB debugging is on |
-| Display | Same as Wi-Fi: `--mode extend` → EVDI connector + our EDID, capture only that output |
-| **Initiate (0.3.1)** | `usb/initiate.py`, see below |
-| Stream | WFD source (M1–M7) → H.264 / MPEG-TS / RTP to the tablet's **tether IP** |
+| IP link (RTP/UDP) | USB tethering → `rndis_host` / `cdc_ncm` / `cdc_ether` + NetworkManager |
+| RTSP tunnel | `adb reverse tcp:7236 tcp:7236` → tablet reaches the PC at `127.0.0.1:7236` |
+| Wake/config | adb writes `{"USB":1}` to `/sdcard/Android/data/<pkg>/files/config/secondscreen.data` for each installed Second Screen package, then opens the app (`--usb-sink-activity`, receiver-named activities, the launcher of `com.samsung.android.secondscreen`; never Smart View's launcher) |
+| **Handshake** | MS-MICE **SOURCE_READY** → tablet `:7250` via `adb forward` (and the tether IP), then wait for the tablet to connect to 7236 |
+| Fallback | generic sinks: dial a listening RTSP port (7236 or a port owned by a receiver app) and run M1–M7 on it |
+| Stream | WFD source → H.264 / MPEG-TS / RTP to the tablet's **tether IP**:19000. When the sink came in via `adb reverse` (peer 127.0.0.1), RTP still goes to the tether IP |
+| Display | Same as Wi-Fi: `--mode extend` → EVDI connector + our EDID |
 
-### Why the PC must initiate
+Every step is logged as `USB: …` (`-v` also shows each adb command). It keeps
+retrying for `--usb-initiate-timeout` (60 s) while the server keeps listening.
+If nothing worked, a guidance block lists what's missing.
 
-With the tether up (e.g. `enx… 10.108.120.2` ↔ tablet `10.108.120.1`) and the
-source listening on `0.0.0.0:7236`, nothing on a Galaxy Tab dials a Linux PC:
-its receivers only accept connections (Wi-Fi Direct) or speak Connlib (cable).
-So after the link is up `UsbInitiator` runs, logging every step as `USB: …`:
-
-1. **adb** (if installed and the device is *authorized*; the serial matching the
-   Samsung USB device is preferred):
-   - `adb reverse tcp:7236 tcp:7236` — a sink on the tablet can then reach us
-     at `rtsp://127.0.0.1:7236`.
-   - `ip -4 -o addr show` on the tablet → its real tether IP (replaces the
-     `.1` guess).
-   - `pm list packages -U` → packages that look like receivers
-     (`secondscreen`, `sink`, `receiver`, `wfd`, `miracast`, `wireless display`…).
-     Smart View (`smartmirroring`) is listed but **not** launched — it casts
-     *from* the tablet.
-   - Try to open a receiver: `--usb-sink-activity PKG/.Activity` if given,
-     else receiver-named activities from `dumpsys package` (`am start -n`),
-     else the launcher activity (`monkey -p`), else a matching custom
-     quick-settings tile (`cmd statusbar click-tile`). Disable with
-     `--no-usb-launch`.
-   - `cat /proc/net/tcp /proc/net/tcp6` → LISTEN sockets on 7236/7250 or owned
-     by a receiver app's uid.
-2. **Dial** each candidate: `tether-IP:port` if the socket is bound to
-   0.0.0.0/the tether IP, and/or `adb forward tcp:0 tcp:<port>` → `127.0.0.1`
-   if bound to 0.0.0.0/loopback. Without adb we blind-dial `7236`/`7250` on the
-   tether peer. The connected socket goes straight to
-   `WfdRtspServer.connect_to()` (no separate probe — some sinks accept one
-   connection): M1 immediately, then M2/M3/M4/M5, SETUP, PLAY. Success = the
-   sink answered M1. RTP/UDP always goes to the tether IP (UDP can't ride adb).
-3. Retry every few seconds for `--usb-initiate-timeout` (60 s); the server
-   keeps listening, so an inbound connection also wins. If nothing worked, a
-   guidance block says exactly what's missing (adb, authorization, receiver
-   app, open port) and what to do — normally: **use Wi-Fi Direct**.
+### Test on hardware (Paulo)
 
 ```bash
 sudo ./scripts/install-udev-samsung.sh
 sudo apt install adb
-# Tablet: Tethering USB + Developer options → USB debugging; accept the RSA prompt
-segunda-tela doctor                     # "-- USB --" section
-segunda-tela -v --usb --mode extend     # verbose: every adb command + dial result
-segunda-tela -v --usb --usb-sink-activity com.example/.SinkActivity
-segunda-tela usb --prefer-adb
-segunda-tela --usb-detect-test
+# Tablet: Settings → Connections → Mobile Hotspot and Tethering → USB tethering
+#         Developer options → USB debugging; accept the RSA prompt
+segunda-tela doctor                       # "-- USB --": Second Screen package, config, :7250
+# Tablet: open Quick panel → "Second screen" and leave it on its waiting screen
+segunda-tela -v --usb --mode extend
+adb shell cat /proc/net/tcp6 | grep -i ':1C52 '   # is anything listening on 7250?
+adb shell ls -l /sdcard/Android/data/com.samsung.android.secondscreen/files/config/
+segunda-tela -v --usb --usb-sink-activity com.samsung.android.secondscreen/.SomeActivity
+adb shell dumpsys package com.samsung.android.secondscreen | grep -A1 -i 'activity\|service' | head -60
 ```
+
+Please send back: the `-v` log, the `doctor` USB section, and the `dumpsys
+package` output if the tablet never shows a listener on 7250.
 
 ### `doctor` USB section
 
-Samsung device in sysfs · udev rule · local port 7236 free · tether
-iface + IPv4 · adb installed · device authorized/unauthorized/offline ·
-tablet tether IP (via adb) · receiver packages · tablet listening sink ports ·
-peer reachable (TCP *refused* counts as reachable) · sink RTSP port open.
-Lines are only failures (`!!`) when a Samsung device is plugged in.
+Samsung device in sysfs · udev rule · local port 7236 free · tether iface +
+IPv4 · adb installed/authorized · tablet tether IP · **Second Screen package** ·
+**cable config file** · **tablet listening on 7250** · other receiver apps ·
+RTSP listeners · reachability of 7250/7236 over the tether. Failures are only
+marked `!!` when a Samsung device is plugged in.
 
-## Honesty / limitations
+## Limitations / open questions
 
-- **Samsung “Second Screen” over the cable** depends on Connlib and will most
-  likely **not** speak to this stack, even with the initiator. Its Wi-Fi
-  Direct mode is plain Miracast → use `segunda-tela --device`.
-- Receiver package/activity names on One UI are **not verified** on hardware;
-  the initiator discovers them by pattern and logs what it found. Paste the
-  `-v` log if it picks the wrong thing; `--usb-sink-activity` overrides it.
-- Android 10+ may hide `/proc/net/tcp` from some contexts; then port discovery
-  is empty and we fall back to blind dialing 7236/7250 over the tether.
-- Over **USB tethering**, a WFD/Smart View sink (or any RTSP client) that can
-  reach `rtsp://<PC-tether-IP>:7236` may work — **untested without hardware**.
-- **adb reverse** makes RTSP available as `127.0.0.1:7236` *on the tablet*; RTP
-  over UDP often still needs tether or extra forwards — also **untested**.
-- Fallback if USB IP cannot be established: use Wi-Fi mode (`segunda-tela`
-  without `--usb`), matching Windows’ Wi-Fi Direct fallback intent.
+- The **Android side was not analysed** (no APK here). Without the MCF/Bluetooth
+  start intent, the tablet app may not open 7250 even when its UI is open.
+  That is the main risk. If so, Wi-Fi Direct (`--device`) is the route that works.
+- The MS-MICE mapping is inferred from the port name, the port number, the
+  roles and Windows' Miracast stack. The bytes we send follow Microsoft's
+  public MS-MICE spec.
+- On Android 11+ `adb shell` may not be allowed to write into another app's
+  `Android/data`. The log says so if the config write fails.
+- Connlib tunnels UDP. We rely on the tether IP, and a sink that binds RTP only
+  to its tunnel endpoint would not receive video.
+- UIBC (50000), the 7260 side channel, the hardware-cursor streams and HDCP are
+  not implemented.

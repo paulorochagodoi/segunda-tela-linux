@@ -1,4 +1,4 @@
-"""USB section of `segunda-tela doctor` (adb, authorization, tether, peer, ports)."""
+"""USB section of `segunda-tela doctor` (adb, authorization, tether, Second Screen app, ports)."""
 from __future__ import annotations
 
 import socket
@@ -9,6 +9,7 @@ from .adb import WFD_PORTS, Adb, same_subnet, sink_packages
 from .detect import find_usb_net_ifaces, list_samsung_usb_devices
 from .initiate import pick_sink_ports, probe_tcp
 from .link import _guess_peer_ip, _iface_ipv4
+from .samsung import SOURCE_READY_PORT, config_path, installed_hosts
 
 UDEV_RULE = Path("/etc/udev/rules.d/99-segunda-tela-samsung.rules")
 
@@ -81,6 +82,7 @@ def usb_checks(
         yield ("ok" if state == "device" else bad), "adb dispositivo", detail
 
     listeners = []
+    mice_listener = None
     if state == "device":
         if local_ip:
             for iface, ip, prefix in adb.ipv4_addrs():
@@ -90,24 +92,37 @@ def usb_checks(
                     break
         pkgs = adb.packages()
         sinks, sources = sink_packages(pkgs)
-        yield ("ok" if sinks else "info"), "apps receptores (sink) no tablet", (
-            ", ".join(sinks) or "nenhum encontrado"
-        ) + (f"; Smart View (source): {', '.join(sources)}" if sources else "")
-        uids = {pkgs[p] for p in sinks if pkgs.get(p, -1) >= 0}
-        listeners = pick_sink_ports(adb.listeners(), uids)
-        yield ("ok" if listeners else "info"), "portas de sink escutando no tablet", (
+        hosts = installed_hosts(pkgs)
+        yield ("ok" if hosts else bad), "Segunda tela Samsung (pacote)", (
+            ", ".join(hosts) or "com.samsung.android.secondscreen não encontrado")
+        for h in hosts:
+            cfg = adb.read_file(config_path(h))
+            yield "info", f"config USB {h}", (cfg.strip() if cfg else "ausente (o PC grava ao conectar)")
+        others = [p for p in sinks if p not in hosts]
+        if others:
+            yield "info", "outros apps receptores", ", ".join(others)
+        uids = {pkgs[p] for p in sinks + hosts if pkgs.get(p, -1) >= 0}
+        all_listeners = adb.listeners()
+        mice_listener = next((l for l in all_listeners if l.port == SOURCE_READY_PORT), None)
+        yield ("ok" if mice_listener else "info"), f"tablet escutando source-ready :{SOURCE_READY_PORT}", (
+            f"{mice_listener.addr}:{mice_listener.port}" if mice_listener else
+            "não — abra a Segunda tela no tablet (ou /proc/net/tcp oculto)")
+        listeners = pick_sink_ports(all_listeners, uids)
+        yield ("ok" if listeners else "info"), "portas RTSP de sink escutando no tablet", (
             ", ".join(f"{l.addr}:{l.port}" for l in listeners) or
-            f"nenhuma em {'/'.join(map(str, WFD_PORTS))} — abra o receptor no tablet")
+            f"nenhuma em {'/'.join(map(str, WFD_PORTS))} (normal: a Segunda tela conecta de volta no PC)")
 
     # --- peer reachability + sink ports over the tether
     if peer_ip:
-        ports = [l.port for l in listeners] or list(WFD_PORTS)
+        ports = [SOURCE_READY_PORT] + ([l.port for l in listeners] or list(WFD_PORTS))
         results = {p: probe(peer_ip, p, 1.5) for p in ports}
         reachable = any(r in ("open", "refused") for r in results.values())
         yield ("ok" if reachable else bad), f"tablet {peer_ip} alcançável", (
             "responde TCP" if reachable else "sem resposta (firewall/IP errado?)")
         for p, r in results.items():
-            yield ("ok" if r == "open" else "info"), f"sink RTSP {peer_ip}:{p}", r
-    if devs and not any(l.port in WFD_PORTS for l in listeners):
-        yield "info", "dica", ("sem sink WFD pelo cabo, a 'Segunda tela' Samsung só funciona por "
-                               "Wi-Fi Direct aqui: segunda-tela list; segunda-tela --device \"<nome>\"")
+            what = "source-ready" if p == SOURCE_READY_PORT else "sink RTSP"
+            yield ("ok" if r == "open" else "info"), f"{what} {peer_ip}:{p}", r
+    if devs and mice_listener is None and not any(l.port in WFD_PORTS for l in listeners):
+        yield "info", "dica", ("abra a 'Segunda tela' no painel rápido do tablet e rode "
+                               "segunda-tela -v --usb; se não atender pelo cabo use Wi-Fi Direct: "
+                               "segunda-tela list; segunda-tela --device \"<nome>\"")

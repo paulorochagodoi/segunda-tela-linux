@@ -15,12 +15,14 @@ from typing import Callable, List, Optional, Sequence
 
 log = logging.getLogger(__name__)
 
-# Standard WFD RTSP port (spec) and the R2/alt port some sinks use.
-WFD_PORTS = (7236, 7250)
+# Sink ports worth dialling with RTSP M1. 7250 is *not* one of them: on Samsung
+# tablets it is the MS-MICE "source ready" port (see samsung.py).
+WFD_PORTS = (7236,)
 
 # Package/activity/tile names that look like a *receiver* (sink) on the tablet.
 SINK_HINT = re.compile(r"second.?screen|wfd.?sink|sink|receiv|wireless.?display|wifi.?display|miracast", re.I)
 # Samsung Smart View is primarily a *source* (casts from the tablet); listed but not auto-launched.
+# (On older One UI it also hosts the Second Screen receiver — samsung.SECOND_SCREEN_PACKAGES.)
 SOURCE_HINT = re.compile(r"smartmirroring|smart.?view|screen.?mirror|cast", re.I)
 
 Runner = Callable[[Sequence[str], float], "tuple[int, str]"]
@@ -236,6 +238,18 @@ class Adb:
     def ipv4_addrs(self) -> list[tuple[str, str, int]]:
         rc, out = self.shell("ip -4 -o addr show")
         return parse_ip_addrs(out) if rc == 0 else []
+
+    def write_file(self, path: str, content: str) -> bool:
+        """Create `path` (and its directory) on the tablet with `content` (no single quotes)."""
+        if "'" in content or "'" in path:
+            raise ValueError("single quotes not supported")
+        d = path.rsplit("/", 1)[0]
+        rc, out = self.shell(f"mkdir -p '{d}' && printf '%s' '{content}' > '{path}' && echo WROTE")
+        return rc == 0 and "WROTE" in out
+
+    def read_file(self, path: str) -> Optional[str]:
+        rc, out = self.shell(f"cat '{path}'")
+        return out if rc == 0 and "No such file" not in out else None
 
     def reverse(self, port: int) -> bool:
         rc, _ = self.run("reverse", f"tcp:{port}", f"tcp:{port}")

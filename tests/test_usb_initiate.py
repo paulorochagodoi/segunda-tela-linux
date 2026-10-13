@@ -65,17 +65,16 @@ def test_pick_and_build_targets():
     ls = [Listener("127.0.0.1", 5037, 2000), Listener("0.0.0.0", 9000, 10234),
           Listener("::", 7236, 10234), Listener("127.0.0.1", 7250, 10234)]
     picked = pick_sink_ports(ls, {10234})
-    assert [l.port for l in picked] == [7236, 7250, 9000]
+    # 7250 is Samsung's source-ready (MS-MICE) port, never dialled with RTSP M1.
+    assert [l.port for l in picked] == [7236, 9000]
     ts = build_targets("10.108.120.1", picked, adb_ok=True)
     assert [(t.host, t.port, t.via) for t in ts] == [
         ("10.108.120.1", 7236, "tether"), ("127.0.0.1", 7236, "adb-forward"),
-        ("127.0.0.1", 7250, "adb-forward"),
         ("10.108.120.1", 9000, "tether"), ("127.0.0.1", 9000, "adb-forward"),
     ]
     assert all(t.media_host == "10.108.120.1" for t in ts if t.via == "adb-forward")
-    # No adb info: blind-dial the standard WFD ports over the tether.
-    assert [(t.port, t.via) for t in build_targets("10.108.120.1", [], adb_ok=False)] == [
-        (7236, "tether"), (7250, "tether")]
+    # No adb info: blind-dial the standard WFD port over the tether.
+    assert [(t.port, t.via) for t in build_targets("10.108.120.1", [], adb_ok=False)] == [(7236, "tether")]
 
 
 def test_probe_tcp_open_and_refused():
@@ -112,9 +111,19 @@ class FakeTabletAdb(Adb):
         if "/proc/net/tcp" in cmd:
             return 0, ("   0: 00000000:1C44 00000000:0000 0A 00000000:00000000 00:00000000 00000000 "
                        "10234        0 1 1\n")
-        if argv[-3:-1] == ["forward", "tcp:0"]:
+        if argv[-2:] == ["tcp:0", "tcp:7236"]:
             return 0, f"{self.sink_port}\n"
+        if argv[-2:] == ["tcp:0", "tcp:7250"]:
+            return 0, f"{_closed_port()}\n"  # nothing serves source-ready on this tablet
         return 0, ""
+
+
+def _closed_port():
+    s = socket.socket()
+    s.bind(("127.0.0.1", 0))
+    port = s.getsockname()[1]
+    s.close()
+    return port
 
 
 def test_initiator_launches_sink_forwards_and_dials():

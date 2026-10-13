@@ -185,6 +185,10 @@ class SessionState:
         return VideoMode(self.width, self.height, self.fps)
 
 
+def _is_loopback(host: str) -> bool:
+    return host.startswith("127.") or host in ("::1", "::ffff:127.0.0.1")
+
+
 class _Handler(socketserver.BaseRequestHandler):
     server: "WfdRtspServer"
 
@@ -241,7 +245,7 @@ class _Handler(socketserver.BaseRequestHandler):
             fps=srv.fps,
             remote=peer,
             local=self.sock.getsockname()[0],
-            media_host=self._media_host,
+            media_host=self._media_host or (srv.loopback_media_host if _is_loopback(peer) else ""),
             outbound=self._outbound,
         )
         state.url = f"rtsp://{state.local}/wfd1.0/streamid=0"
@@ -543,6 +547,9 @@ class WfdRtspServer(socketserver.ThreadingTCPServer):
         self.audio = audio
         self.m1_delay_s = m1_delay_s
         self.keepalive_s = keepalive_s
+        # RTP destination for sinks that reach us via loopback (`adb reverse`):
+        # their RTSP peer is 127.0.0.1 but media must go to the tablet's tether IP.
+        self.loopback_media_host = ""
         self._thread: Optional[threading.Thread] = None
         self._handlers: set[_Handler] = set()
         self._hlock = threading.Lock()

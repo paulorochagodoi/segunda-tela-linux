@@ -81,7 +81,7 @@ EVDI DKMS), **not** a from-scratch kernel driver.
 | Virtual monitor (extend mode) | Yes | PipeWire / xdg-desktop-portal RemoteDesktop+Screencast; optional EVDI; X11 dummy sink |
 | Tablet "Second Screen" one-tap via MCF | **Blocked / incomplete** | Requires Samsung MCF stack, app IDs, and likely account/device attestation — not available as open source |
 | UIBC touch / S Pen | Partial | Standard WFD UIBC if sink exposes it; Samsung extensions unknown |
-| USB second screen | Partial (v0.2) | See below + `docs/USB.md`: tether/adb IP then open WFD; Connlib not cloned |
+| USB second screen | Partial (v0.3.2) | See `docs/USB.md`: WFD inside Connlib port tunnel; we use adb + MS-MICE source-ready on 7250 |
 | Samsung trademarks / UI clone | No | Independent name and UI |
 
 ## Limitations & ethics
@@ -167,7 +167,8 @@ Evidence (`Samsung.SecondScreen.Usb`, P/Invoke to `ss_conn_lib2.dll`, strings):
   **`ConnlibConnectionGetPort`**.
 - Managed follow-up: `OpenTcpClient` / `OpenTcpServer` / `OpenUdpClient` with
   fields/ports named `RtspPort`, `RtpPort`, `UibcPort`, `HdcpPort`, etc.
-- MTP (`UsbMtp`) uploads a config file; not the H.264 transport.
+- MTP (`UsbMtp`) uploads a config file (`files/config/secondscreen.data`, `USB` flag); not the H.264 transport.
+- Ports/handshake (verified 2026-10): 7250 source-ready (PC connects), 7236 RTSP (PC listens), RTP 19000/19001 — see `docs/USB.md`.
 - Failure string: `Failed to open USB. Projecting over Wi-Fi Direct instead.`
 
 **Linux clean-room mirror:** obtain an IP interface via RNDIS/NCM tether or adb,
