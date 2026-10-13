@@ -48,6 +48,7 @@ class SecondScreenSession:
         self.server: Optional[WfdRtspServer] = None
         self.pipeline: Optional[StreamPipeline] = None
         self.last_state: Optional[SessionState] = None
+        self.usb_initiator = None
         self._plock = threading.Lock()
         if advertise_ip:
             self.advertise_ip = advertise_ip
@@ -82,10 +83,21 @@ class SecondScreenSession:
         if link is not None and link.local_ip:
             self.advertise_ip = link.local_ip
 
+    def start_usb_initiator(self, **kw):
+        """USB: dial the tablet's sink (adb/tether) instead of only waiting for it."""
+        from .usb.initiate import UsbInitiator
+
+        assert self.server is not None and self.usb_link is not None
+        self.usb_initiator = UsbInitiator(self.server, self.usb_link, rtsp_port=self.rtsp_port, **kw)
+        self.usb_initiator.start()
+        return self.usb_initiator
+
     def prepare_display(self) -> None:
         if self.usb_link:
             for note in self.usb_link.notes:
                 log.info("USB: %s", note)
+            # Same display path as Wi-Fi: extend → EVDI connector + capture of that output.
+            log.info("USB link %s: display mode=%s (same EVDI/portal path as Wi-Fi)", self.usb_link.transport, self.mode)
 
         vw, vh = self.want_size or DEFAULT_VIRTUAL_SIZE
         self.display = create_virtual_display(vw, vh, self.mode, self.fps, capture=self.capture)
@@ -127,7 +139,7 @@ class SecondScreenSession:
                 self.pipeline.stop()
             self.pipeline = StreamPipeline(
                 capture_source=self.display.new_capture(),
-                dest_host=state.remote,
+                dest_host=state.rtp_host,
                 dest_port=state.rtp_port,
                 rtcp_port=state.rtcp_port,
                 local_rtp_port=self.server.server_rtp_port if self.server else 19100,
@@ -151,6 +163,9 @@ class SecondScreenSession:
                 self.pipeline = None
 
     def stop(self) -> None:
+        if self.usb_initiator is not None:
+            self.usb_initiator.stop()
+            self.usb_initiator = None
         with self._plock:
             if self.pipeline:
                 self.pipeline.stop()

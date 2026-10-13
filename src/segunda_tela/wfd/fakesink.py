@@ -34,8 +34,8 @@ class FakeSinkResult:
 
 
 class FakeSink:
-    def __init__(self, host: str, port: int, timeout: float = 5.0) -> None:
-        self.sock = socket.create_connection((host, port), timeout=timeout)
+    def __init__(self, host: str, port: int, timeout: float = 5.0, sock: Optional[socket.socket] = None) -> None:
+        self.sock = sock if sock is not None else socket.create_connection((host, port), timeout=timeout)
         self.sock.settimeout(timeout)
         self.reader = MessageReader(self.sock)
         self.cseq = 0
@@ -89,9 +89,11 @@ def run_fake_sink(
     display_edid: str = "none",
     wait_keepalive: bool = False,
     timeout: float = 5.0,
+    sock: Optional[socket.socket] = None,
 ) -> FakeSinkResult:
+    """Drive one sink session. With `sock`, use that (already accepted) connection."""
     res = FakeSinkResult()
-    s = FakeSink(host, port, timeout)
+    s = FakeSink(host, port, timeout, sock=sock)
     try:
         res.m1 = s.expect_request("OPTIONS")
         assert res.m1.headers.get("require") == "org.wfa.wfd1.0", res.m1.headers

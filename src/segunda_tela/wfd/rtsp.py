@@ -18,6 +18,10 @@ the TCP connect with a real sink.
 If the peer speaks first (OPTIONS before our M1, e.g. VLC or the legacy
 loopback test) we fall back to plain reactive RTSP handling.
 
+`WfdRtspServer.connect_to()` runs the same source state machine over an
+*outbound* TCP connection (USB mode: the PC dials a sink port on the tablet
+instead of waiting for the tablet to dial us). M1 is sent immediately.
+
 Written from the public spec; behaviour cross-checked against the open-source
 gnome-network-displays project. Not affiliated with Samsung.
 """
@@ -166,6 +170,13 @@ class SessionState:
     sink: Optional[SinkCaps] = None
     negotiated: Optional[Negotiated] = None
     m4_attempts: int = 0
+    media_host: str = ""  # RTP destination when it differs from the RTSP peer (adb forward)
+    outbound: bool = False
+    m1_answered: bool = False  # peer replied to our M1 → it speaks RTSP/WFD
+
+    @property
+    def rtp_host(self) -> str:
+        return self.media_host or self.remote
 
     @property
     def mode(self) -> VideoMode:
@@ -176,6 +187,13 @@ class SessionState:
 
 class _Handler(socketserver.BaseRequestHandler):
     server: "WfdRtspServer"
+
+    def __init__(self, request, client_address, server, outbound: bool = False, media_host: str = "",
+                 on_state: Optional[Callable[["SessionState"], None]] = None) -> None:
+        self._outbound = outbound
+        self._media_host = media_host
+        self._on_state = on_state
+        super().__init__(request, client_address, server)
 
     # --- plumbing
     def setup(self) -> None:
@@ -223,11 +241,19 @@ class _Handler(socketserver.BaseRequestHandler):
             fps=srv.fps,
             remote=peer,
             local=self.sock.getsockname()[0],
+            media_host=self._media_host,
+            outbound=self._outbound,
         )
         state.url = f"rtsp://{state.local}/wfd1.0/streamid=0"
         self.state = state
+        if self._on_state:
+            self._on_state(state)
         srv._register(self)
-        log.info("RTSP sink connected from %s (local %s)", peer, state.local)
+        if self._outbound:
+            log.info("RTSP: connected out to sink %s:%s (local %s, RTP → %s)",
+                     peer, self.client_address[1], state.local, state.rtp_host)
+        else:
+            log.info("RTSP sink connected from %s (local %s)", peer, state.local)
         try:
             self._serve(state)
         finally:
@@ -239,17 +265,18 @@ class _Handler(socketserver.BaseRequestHandler):
 
     def _serve(self, state: SessionState) -> None:
         srv = self.server
-        # Give a plain RTSP client a moment to speak first.
-        self.sock.settimeout(srv.m1_delay_s)
         first: bytes = b""
-        try:
-            first = self.sock.recv(4096)
-            if not first:
+        if not self._outbound:
+            # Give a plain RTSP client a moment to speak first.
+            self.sock.settimeout(srv.m1_delay_s)
+            try:
+                first = self.sock.recv(4096)
+                if not first:
+                    return
+            except socket.timeout:
+                pass
+            except OSError:
                 return
-        except socket.timeout:
-            pass
-        except OSError:
-            return
 
         if first:
             state.wfd = False
@@ -320,6 +347,7 @@ class _Handler(socketserver.BaseRequestHandler):
         st = self.state
         srv = self.server
         if purpose == "M1":
+            st.m1_answered = True
             if msg.status != 200 or "org.wfa.wfd1.0" not in msg.headers.get("public", "org.wfa.wfd1.0"):
                 log.warning("sink M1 reply unexpected: %s %s", msg.first_line, msg.headers.get("public"))
             self._m1_ok = True
@@ -535,6 +563,48 @@ class WfdRtspServer(socketserver.ThreadingTCPServer):
         self._thread = threading.Thread(target=self.serve_forever, name="wfd-rtsp", daemon=True)
         self._thread.start()
         log.info("WFD RTSP source listening on %s:%s", *self.server_address)
+
+    @property
+    def active_sessions(self) -> int:
+        with self._hlock:
+            return len(self._handlers)
+
+    def connect_to(
+        self,
+        host: str,
+        port: int = WFD_DEFAULT_PORT,
+        timeout: float = 3.0,
+        media_host: str = "",
+        sock: Optional[socket.socket] = None,
+    ) -> threading.Thread:
+        """Dial a sink's RTSP port and run the source M1–M7 flow over that socket.
+
+        `media_host` overrides the RTP destination (e.g. RTSP via `adb forward`
+        on 127.0.0.1 while RTP goes to the tablet's tether IP). Raises OSError
+        if the TCP connect fails. The returned thread gets a `wfd_state`
+        attribute (SessionState) once the session starts.
+        """
+        if sock is None:
+            sock = socket.create_connection((host, port), timeout=timeout)
+        sock.settimeout(None)
+        log.info("RTSP: TCP connected to %s:%s — sending M1", host, port)
+
+        def run() -> None:
+            try:
+                _Handler(sock, (host, port), self, outbound=True, media_host=media_host,
+                         on_state=lambda st: setattr(t, "wfd_state", st))
+            except Exception as exc:  # noqa: BLE001
+                log.warning("outbound RTSP session %s:%s ended: %s", host, port, exc)
+            finally:
+                try:
+                    sock.close()
+                except OSError:
+                    pass
+
+        t = threading.Thread(target=run, name=f"wfd-out-{host}:{port}", daemon=True)
+        t.wfd_state = None  # type: ignore[attr-defined]
+        t.start()
+        return t
 
     def stop(self) -> None:
         with self._hlock:

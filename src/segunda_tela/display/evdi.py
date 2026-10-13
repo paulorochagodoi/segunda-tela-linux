@@ -25,6 +25,7 @@ from typing import Callable, Optional
 log = logging.getLogger(__name__)
 
 MAX_DIRTY_RECTS = 16
+EVDI_AVAILABLE = 0  # enum evdi_device_status: AVAILABLE, UNRECOGNIZED, NOT_PRESENT
 
 
 class EvdiError(RuntimeError):
@@ -174,17 +175,30 @@ class EvdiMonitor:
             raise EvdiError(f"kernel module evdi not loaded.\n{SETUP_HINT}")
         self._lib = load_libevdi()
         handle = None
-        if hasattr(self._lib, "evdi_open_attached_to"):
+        tried: list[str] = []
+        # Prefer an existing evdi card (created by setup-evdi.sh / initial_device_count):
+        # evdi_open_attached_to(NULL) may try to *add* a device via sysfs, which needs root.
+        for card in evdi_cards():
+            status = self._lib.evdi_check_device(card)
+            if status != EVDI_AVAILABLE:
+                tried.append(f"card{card}: status {status}")
+                continue
+            if not os.access(f"/dev/dri/card{card}", os.R_OK | os.W_OK):
+                tried.append(f"card{card}: /dev/dri/card{card} sem permissão rw")
+                continue
+            handle = self._lib.evdi_open(card)
+            if handle:
+                log.info("EVDI: using /dev/dri/card%d", card)
+                break
+            tried.append(f"card{card}: evdi_open falhou (em uso por outro processo?)")
+        if not handle and hasattr(self._lib, "evdi_open_attached_to"):
             # NULL parent = first free generic device (adds one if permitted).
             handle = self._lib.evdi_open_attached_to(None)
-        if not handle:
-            for card in evdi_cards():
-                handle = self._lib.evdi_open(card)
-                if handle:
-                    break
+            if not handle:
+                tried.append("evdi_open_attached_to(NULL) falhou")
         if not handle:
             raise EvdiError(
-                "no usable evdi device (none present, or /dev/dri/cardN not accessible).\n" + SETUP_HINT
+                "no usable evdi device (" + ("; ".join(tried) or "none present") + ").\n" + SETUP_HINT
             )
         self._handle = handle
         self._lib.evdi_connect(self._handle, self.edid, len(self.edid), self.area_limit)

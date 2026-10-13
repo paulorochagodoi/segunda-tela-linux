@@ -14,6 +14,15 @@ segunda-tela list                   # tablet com a recepção de tela aberta
 segunda-tela --mode extend --device "Galaxy Tab S9"
 ```
 
+Cabo USB (Tethering USB + Depuração USB no tablet; o PC inicia a sessão via adb/tether):
+
+```bash
+segunda-tela doctor                  # seção "-- USB --"
+segunda-tela -v --usb --mode extend
+```
+
+Detalhes e limites: [docs/USB.md](docs/USB.md).
+
 ## UI e o erro «No module named gi»
 
 O módulo `gi` vem do apt (`python3-gi`), não do pip. O `install.sh` usa

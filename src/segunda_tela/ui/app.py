@@ -193,6 +193,12 @@ def run_ui(args) -> int:
                             where = f"P2P {link.interface} ({link.peer.label})"
                         elif link_kind == 2:
                             where = f"USB/{usb_link.transport}"
+                            s.start_usb_initiator(
+                                launch=not getattr(args, "no_usb_launch", False),
+                                sink_activity=getattr(args, "usb_sink_activity", None),
+                                timeout_s=float(getattr(args, "usb_initiate_timeout", 60.0)),
+                                say=lambda m: GLib.idle_add(set_status, m),
+                            )
                         else:
                             where = "LAN"
                         holder["session"] = s

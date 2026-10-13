@@ -9,6 +9,15 @@ from . import __app_name__, __version__
 from .util.logging import setup_logging
 
 
+def _usb_initiate_args(p: argparse.ArgumentParser) -> None:
+    p.add_argument("--no-usb-launch", action="store_true",
+                   help="USB: do not try to open the receiver app/tile on the tablet via adb")
+    p.add_argument("--usb-sink-activity", metavar="PKG/.Activity",
+                   help="USB: tablet activity to start via adb (am start -n) before dialling the sink")
+    p.add_argument("--usb-initiate-timeout", type=float, default=60.0,
+                   help="USB: seconds to keep dialling the tablet's sink port (default 60)")
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="segunda-tela",
@@ -52,6 +61,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("--prefer-adb", action="store_true", help="With --usb, try adb reverse before USB tethering")
     p.add_argument("--usb-wait", type=float, default=20.0, help="Seconds to wait for USB tether interface (default 20)")
+    _usb_initiate_args(p)
     p.add_argument(
         "--loopback-test",
         action="store_true",
@@ -67,10 +77,11 @@ def build_parser() -> argparse.ArgumentParser:
     usb_p = sub.add_parser("usb", help="Same as --usb (subcommand form)")
     usb_p.add_argument("--prefer-adb", action="store_true")
     usb_p.add_argument("--usb-wait", type=float, default=20.0)
+    _usb_initiate_args(usb_p)
     list_p = sub.add_parser("list", help="Discover Wi-Fi P2P peers (Miracast sinks)")
     list_p.add_argument("--timeout", type=float, default=15.0, help="Discovery seconds (default 15)")
     list_p.add_argument("--all", action="store_true", help="Also show peers without WFD IEs")
-    sub.add_parser("doctor", help="Check EVDI, GStreamer encoders, NetworkManager P2P and portal")
+    sub.add_parser("doctor", help="Check EVDI, GStreamer encoders, NetworkManager P2P, portal and USB/adb")
     return p
 
 
@@ -147,6 +158,15 @@ def cmd_doctor(_args) -> int:
             s.finish_setup()
     except Exception as exc:  # noqa: BLE001
         line(False, "ScreenCast portal", str(exc))
+
+    from .usb.doctor import usb_checks
+
+    print("-- USB --")
+    for status, label, detail in usb_checks(rtsp_port=getattr(_args, "port", 7236)):
+        if status == "info":
+            print(f"[..] {label}{(' — ' + detail) if detail else ''}")
+        else:
+            line(status == "ok", label, detail)
     return 0 if ok else 1
 
 
@@ -237,6 +257,13 @@ def main(argv: list[str] | None = None) -> int:
         print(note, flush=True)
 
     how = "USB+WFD" if use_usb else "WFD"
+    if use_usb:
+        session.start_usb_initiator(
+            launch=not args.no_usb_launch,
+            sink_activity=args.usb_sink_activity,
+            timeout_s=args.usb_initiate_timeout,
+            say=lambda m: print(m, flush=True),
+        )
     if args.device:
         from .wfd.p2p import P2PError, find_and_connect
 

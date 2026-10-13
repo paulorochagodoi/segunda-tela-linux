@@ -22,7 +22,7 @@ como **segunda tela estendida** no **Pop!_OS** e outros desktops Linux, via
 | **Estender**: monitor virtual EVDI com EDID próprio (1920x1200, 2560x1600, 1080p) | Implementado · **não testado em hardware** |
 | Captura só do monitor virtual: portal ScreenCast (COSMIC) ou leitura direta do EVDI | Implementado · **não testado em hardware** |
 | Espelhar (`--mode mirror`) via portal / X11 | Implementado |
-| USB cabo (tether/adb → WFD) | Implementado (sem Connlib) |
+| USB cabo: tether/adb → PC **inicia** a sessão (abre o receptor via adb, acha a porta do sink, disca M1–M7) | Implementado (sem Connlib) · testado contra sink simulado · **não testado em hardware** |
 | Pareamento MCF “Second Screen” one-tap da Samsung | **Não** — ver [docs/SAMSUNG_MCF.md](docs/SAMSUNG_MCF.md) |
 | UIBC / toque / S Pen | Não implementado |
 
@@ -64,7 +64,7 @@ segunda-tela --mode extend --device "Galaxy Tab S9" --capture evdi   # sem diál
 
 segunda-tela --ui              # UI: procurar, escolher, estender/espelhar, conectar
 segunda-tela --loopback-test   # CI / sem tablet (M1–M7 + RTSP simples)
-segunda-tela doctor            # checa EVDI, encoders, P2P, portal
+segunda-tela doctor            # checa EVDI, encoders, P2P, portal, USB/adb
 ```
 
 No modo estender, o COSMIC mostra o seletor de tela: **escolha “Segunda Tela”**
@@ -89,14 +89,23 @@ segunda-tela --ui
 
 ```bash
 sudo ./scripts/install-udev-samsung.sh
-# No tablet: Tethering USB (ou depuração USB / adb)
-segunda-tela --usb
+sudo apt install adb
+# No tablet: Tethering USB **e** Depuração USB (aceite “Permitir depuração USB”)
+segunda-tela doctor                   # seção "-- USB --": adb, autorização, tether, IP do tablet, portas
+segunda-tela -v --usb --mode extend   # mesmo caminho EVDI (estender) do Wi-Fi
 segunda-tela usb --prefer-adb
 ```
 
-O app Windows usa Connlib proprietário para obter IP+porta no cabo e então
-RTSP/RTP. Aqui: **tether RNDIS/NCM ou adb reverse**, depois o mesmo source WFD.
-Detalhes e limites: [docs/USB.md](docs/USB.md).
+No cabo **o PC toma a iniciativa** (nada no tablet disca para o PC sozinho):
+via adb faz `adb reverse tcp:7236`, procura e abre apps/atividades/blocos do
+painel rápido com cara de receptor, lê as portas TCP em escuta no tablet e
+**conecta no sink** (pelo IP do tether ou por `adb forward`) rodando M1→M7
+como source. O vídeo (RTP/UDP) vai para o IP do tablet no tether. Se nada
+aceitar, o programa diz exatamente o que fazer.
+
+O app Windows usa Connlib proprietário para obter IP+porta no cabo; a
+“Segunda tela” Samsung **por cabo** depende dele e provavelmente **não**
+funciona aqui — use Wi-Fi Direct (`--device`). Detalhes: [docs/USB.md](docs/USB.md).
 
 ## Análise do app Windows
 
@@ -152,8 +161,16 @@ VAAPI) are **untested in CI**; the RTSP/WFD exchange is covered by a loopback
 test against a simulated sink, and the media pipeline was validated by
 encoding and decoding locally.
 
-USB cable mode: [docs/USB.md](docs/USB.md). Samsung's proprietary MCF
-“Second Screen” one-tap pairing is out of scope.
+USB cable mode (0.3.1): with `--usb` the PC now *initiates*. Over adb (if
+authorized) it sets `adb reverse tcp:7236`, tries to open receiver-looking
+apps/activities/quick-settings tiles, reads the tablet's listening TCP ports,
+then dials the sink (tether IP or `adb forward`) and runs the source M1–M7 on
+that socket; RTP goes to the tablet's tether IP. Extend uses the same EVDI path
+as Wi-Fi. If nothing on the tablet accepts, it prints concrete next steps —
+Samsung's cable "Second Screen" needs the proprietary Connlib, so Wi-Fi Direct
+(`--device`) is the supported route. `segunda-tela doctor` has a USB section
+(adb, authorization, tether iface/IP, peer reachability, ports). Details:
+[docs/USB.md](docs/USB.md). Samsung's MCF one-tap pairing is out of scope.
 
 License: MIT. Wi-Fi P2P/WFD behaviour was studied in GNOME Network Displays
 (GPL-3.0) as a reference only; no GND code was copied — see [NOTICE](NOTICE).
