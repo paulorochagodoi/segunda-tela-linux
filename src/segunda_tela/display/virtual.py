@@ -1,8 +1,10 @@
 """Display side: create the extra monitor (extend) and pick a capture source.
 
 extend:  EVDI virtual connector with our EDID → compositor adds an output →
-         capture *that* output via the ScreenCast portal (user picks it once)
-         or grab frames straight from EVDI (`--capture evdi`).
+         grab *that* output's frames straight from EVDI (default; no portal).
+         The ScreenCast portal is a fallback (EVDI unusable, or
+         `--capture portal`); a remembered portal choice that is not the
+         EVDI output (e.g. eDP-1) is forgotten and the picker asked again.
 mirror:  portal screencast of an existing output (Wayland) / ximagesrc (X11).
 test:    videotestsrc (CI, no desktop).
 
@@ -32,6 +34,7 @@ class VirtualDisplay:
     fps: int = 30
     evdi: Optional[object] = None  # EvdiMonitor
     portal: Optional[object] = None  # PortalCapture
+    layout: Optional[object] = None  # randr.EvdiLayoutStatus
     notes: list[str] = field(default_factory=list)
 
     @property
@@ -106,7 +109,7 @@ def resolve_capture(mode: str, capture: str, wayland: bool, x11: bool) -> str:
     if capture != "auto":
         return capture
     if mode == "extend":
-        return "portal" if wayland else "evdi"
+        return "evdi"
     if wayland:
         return "portal"
     if x11:
@@ -123,6 +126,12 @@ def evdi_modes(width: int, height: int, fps: int) -> list[tuple[int, int, int]]:
     return modes
 
 
+def _fallback_backend(wayland: bool, x11: bool) -> str:
+    if wayland:
+        return "portal"
+    return "x11" if x11 else "test"
+
+
 def create_virtual_display(
     width: int = 1920,
     height: int = 1200,
@@ -131,7 +140,8 @@ def create_virtual_display(
     capture: str = "auto",
     portal_restore: bool = True,
 ) -> VirtualDisplay:
-    backend = resolve_capture(mode, capture, _wayland(), _x11())
+    wayland, x11 = _wayland(), _x11()
+    backend = resolve_capture(mode, capture, wayland, x11)
     disp = VirtualDisplay(width=width, height=height, mode=mode, backend=backend, fps=fps)
 
     if backend == "test":
@@ -153,13 +163,12 @@ def create_virtual_display(
             msg = f"EXTEND indisponível (EVDI): {exc}"
             log.error("%s", msg)
             disp.notes.append(msg)
-            if backend == "evdi":
+            if capture == "evdi":
                 raise
-            disp.notes.append("Continuando com captura do portal (efetivamente espelhamento).")
-        if backend == "evdi":
-            disp.backend = "evdi-grab"
-            return disp
-        # Give the compositor a moment to light up the new connector before the picker opens.
+            if backend == "evdi":
+                backend = disp.backend = _fallback_backend(wayland, x11)
+            disp.notes.append(f"Continuando com captura {backend} (efetivamente espelhamento).")
+        # Give the compositor a moment to light up the new connector.
         if disp.evdi is not None:
             deadline = time.monotonic() + 5
             while disp.evdi.mode is None and time.monotonic() < deadline:
@@ -169,28 +178,73 @@ def create_virtual_display(
                     "O compositor ainda não ativou o monitor virtual. Em Configurações → Telas, "
                     "ative/posicione 'Segunda Tela' (ver docs/COSMIC.md)."
                 )
+            _check_layout(disp)
+        if backend == "evdi":
+            disp.backend = "evdi-grab"
+            log.info("Captura: leitura direta do EVDI (sem portal)")
+            return disp
 
     if backend == "portal":
-        from .portal import PortalError, looks_like_primary, open_screencast
-
-        key = "extend" if mode == "extend" else "mirror"
-        log.info("Abrindo seletor do portal ScreenCast — escolha a tela %s",
-                 "'Segunda Tela' (virtual)" if mode == "extend" else "a espelhar")
-        try:
-            cap = open_screencast(persist_key=key if portal_restore else None)
-        except PortalError as exc:
-            disp.close()
-            raise RuntimeError(f"ScreenCast portal: {exc}") from exc
-        disp.portal = cap
-        expected = disp.evdi.mode[:2] if disp.evdi is not None and disp.evdi.mode else None
-        if mode == "extend" and looks_like_primary(cap.streams[0], expected):
-            disp.notes.append(
-                "AVISO: a tela escolhida no portal parece ser a principal (eDP-1), não a virtual. "
-                "Apague ~/.config/segunda-tela/portal.json e escolha 'Segunda Tela'."
-            )
+        _open_portal(disp, portal_restore)
         return disp
 
     if backend == "x11":
         return disp
 
     raise ValueError(f"unknown capture backend {backend!r}")
+
+
+def _check_layout(disp: VirtualDisplay) -> None:
+    """Log the compositor layout; note clearly if EVDI is mirrored or absent."""
+    from .randr import check_layout
+
+    try:
+        st = check_layout()
+    except Exception as exc:  # noqa: BLE001 — diagnostics must never stop the session
+        log.warning("layout check failed: %s", exc)
+        return
+    disp.layout = st
+    if st.status in ("absent", "disabled", "mirrored"):
+        disp.notes.append(f"AVISO (tela estendida): {st.message}")
+
+
+def _open_portal(disp: VirtualDisplay, restore: bool) -> None:
+    from .portal import PortalError, forget_restore_token, load_restore_token, open_screencast, stream_is_output
+
+    # Without an EVDI output the portal can only mirror: keep that choice apart
+    # from the remembered "extend" one.
+    extend = disp.mode == "extend" and disp.evdi is not None
+    key = "extend" if extend else "mirror"
+    log.info("Abrindo seletor do portal ScreenCast — escolha a tela %s",
+             "'Segunda Tela' (virtual)" if extend else "a espelhar")
+    for attempt in (1, 2):
+        remembered = restore and load_restore_token(key) is not None
+        try:
+            cap = open_screencast(persist_key=key if restore else None)
+        except PortalError as exc:
+            disp.close()
+            raise RuntimeError(f"ScreenCast portal: {exc}") from exc
+        if not extend:
+            disp.portal = cap
+            return
+        mon = disp.evdi
+        expected = mon.mode[:2] if mon.mode else None
+        stream = cap.streams[0]
+        evdi_out = getattr(disp.layout, "output", None)
+        if stream_is_output(stream, expected, evdi_out.position if evdi_out else None):
+            disp.portal = cap
+            return
+        cap.close()
+        forgot = forget_restore_token(key)
+        log.warning(
+            "Portal: a tela %s (pos=%s size=%s) não é a saída EVDI 'Segunda Tela' (parece eDP-1)%s",
+            "lembrada" if remembered else "escolhida", stream.position, stream.size,
+            " — escolha salva apagada de ~/.config/segunda-tela/portal.json" if forgot else "",
+        )
+        if attempt == 1:
+            log.warning("Abrindo o seletor de novo — escolha 'Segunda Tela'")
+    disp.notes.append(
+        "AVISO: o portal não entregou a tela virtual; usando leitura direta do EVDI em vez dela."
+    )
+    disp.evdi.enable_grab()
+    disp.backend = "evdi-grab"

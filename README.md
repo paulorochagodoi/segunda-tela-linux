@@ -42,7 +42,9 @@ A 0.3 corrige os três.
 - Wi-Fi com P2P no NetworkManager (`nmcli device` mostra `p2p-dev-wlan0/wlo1`)
 - GStreamer 1.0 (base/good/**bad**/ugly/libav/pipewire) + VA-API (`mesa-va-drivers`)
 - `python3-gi` (Gio para NetworkManager e portal; GTK4/libadwaita para a UI)
-- Para **estender**: `evdi-dkms` + `libevdi1` (pacotes da distro)
+- Para **estender**: `evdi-dkms` + `libevdi1` (pacotes da distro; se não
+  compilarem no seu kernel, o `setup-evdi.sh` instala o release do GitHub via
+  DKMS). Secure Boot: cadastre a chave MOK — ver [docs/COSMIC.md](docs/COSMIC.md#secure-boot-mok)
 
 ```bash
 sudo ./scripts/install-deps-popos.sh
@@ -60,15 +62,16 @@ Guia completo do Pop!_OS 24.04 / COSMIC: **[docs/COSMIC.md](docs/COSMIC.md)**.
 segunda-tela list                                    # tablets/sinks Miracast por perto
 segunda-tela --mode extend --device "Galaxy Tab S9"  # monitor virtual + Wi-Fi Direct + WFD
 segunda-tela --mode mirror --device "Galaxy Tab S9"  # espelhar
-segunda-tela --mode extend --device "Galaxy Tab S9" --capture evdi   # sem diálogo do portal
+segunda-tela --mode extend --device "Galaxy Tab S9" --capture portal # captura pelo portal (fallback)
 
 segunda-tela --ui              # UI: procurar, escolher, estender/espelhar, conectar
 segunda-tela --loopback-test   # CI / sem tablet (M1–M7 + RTSP simples)
 segunda-tela doctor            # checa EVDI, encoders, P2P, portal, USB/adb
 ```
 
-No modo estender, o COSMIC mostra o seletor de tela: **escolha “Segunda Tela”**
-(o monitor virtual). Na primeira vez, posicione-o em Configurações → Telas.
+No modo estender, os quadros são lidos direto do monitor virtual EVDI — sem
+seletor do portal, sem risco de capturar o eDP-1. Na primeira vez, posicione
+“Segunda Tela” em Configurações → Telas.
 
 ### UI: «No module named gi»
 
@@ -174,8 +177,10 @@ What's new in 0.3:
   port (usually 19000).
 - **Extend** creates an EVDI virtual connector with our own EDID (1920x1200,
   2560x1600, 1080p @60) so COSMIC treats it as a real monitor, then captures
-  *only that output* via the xdg-desktop-portal ScreenCast (or directly from
-  EVDI with `--capture evdi`).
+  *only that output* by grabbing its frames straight from EVDI (no portal
+  dialog). The ScreenCast portal is a fallback (`--capture portal`, or EVDI
+  unusable); a remembered portal choice that is not the EVDI output is
+  discarded.
 - H.264 via VA-API (`vah264enc`, then `vaapih264enc`) with `x264enc` fallback.
 - GTK UI: discover peers, pick one, extend/mirror toggle, connect.
 

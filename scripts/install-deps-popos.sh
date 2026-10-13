@@ -22,6 +22,8 @@ apt-get install -y gstreamer1.0-vaapi || true
 
 # Portal do COSMIC (Pop!_OS 24.04). Em GNOME é o xdg-desktop-portal-gnome.
 apt-get install -y xdg-desktop-portal-cosmic 2>/dev/null || apt-get install -y xdg-desktop-portal-gnome 2>/dev/null || true
+# Layout das telas (verifica se a "Segunda Tela" está estendida): cosmic-randr; wlr-randr em outros compositores.
+apt-get install -y cosmic-randr 2>/dev/null || apt-get install -y wlr-randr 2>/dev/null || true
 
 # EVDI (monitor virtual para o modo estender): módulo DKMS + libevdi.
 # Não falha a instalação base se o kernel/headers não casarem — ver scripts/setup-evdi.sh.

@@ -56,7 +56,8 @@ def build_parser() -> argparse.ArgumentParser:
         "--capture",
         choices=["auto", "portal", "evdi", "x11", "test"],
         default="auto",
-        help="Frame source: portal (ScreenCast), evdi (grab virtual output directly), x11, test pattern",
+        help="Frame source (auto: extend → evdi, portal only as fallback; mirror → portal/x11): "
+             "evdi (grab the virtual output directly), portal (ScreenCast), x11, test pattern",
     )
     p.add_argument(
         "--encoder",
@@ -107,7 +108,8 @@ def build_parser() -> argparse.ArgumentParser:
     list_p = sub.add_parser("list", help="Discover Wi-Fi P2P peers (Miracast sinks)")
     list_p.add_argument("--timeout", type=float, default=15.0, help="Discovery seconds (default 15)")
     list_p.add_argument("--all", action="store_true", help="Also show peers without WFD IEs")
-    sub.add_parser("doctor", help="Check EVDI, GStreamer encoders, NetworkManager P2P, portal and USB/adb")
+    sub.add_parser("doctor", help="Check EVDI (and that COSMIC extends onto it), GStreamer encoders, "
+                                  "NetworkManager P2P, portal and USB/adb")
     return p
 
 
@@ -157,12 +159,13 @@ def cmd_doctor(_args) -> int:
     encs = [e for e in ENCODER_ORDER if gst_element_available(e)]
     line(bool(encs), "H.264 encoders", ", ".join(encs) or "none (install gstreamer1.0-plugins-bad / -vaapi / -ugly)")
     print(f"     → would use: {pick_encoder()}")
-    line(ev.module_loaded(), "evdi kernel module", "" if ev.module_loaded() else "sudo modprobe evdi")
+    line(ev.module_loaded(), "evdi kernel module", "" if ev.module_loaded() else
+         "sudo ./scripts/setup-evdi.sh (Secure Boot: cadastre a chave MOK, ver docs/COSMIC.md)")
     try:
         ev.load_libevdi()
         line(True, "libevdi")
     except ev.EvdiError:
-        line(False, "libevdi", "sudo apt install libevdi1")
+        line(False, "libevdi", "sudo ./scripts/setup-evdi.sh")
     line(bool(ev.evdi_cards()), "evdi DRM device", ev.device_node_hint())
     session = os.environ.get("XDG_SESSION_TYPE", "?")
     desktop = os.environ.get("XDG_CURRENT_DESKTOP", "?")
@@ -184,6 +187,16 @@ def cmd_doctor(_args) -> int:
             s.finish_setup()
     except Exception as exc:  # noqa: BLE001
         line(False, "ScreenCast portal", str(exc))
+
+    from .display.randr import layout_checks, probe_evdi_layout
+
+    print("-- Tela estendida (COSMIC) --")
+    can_probe = ev.module_loaded() and bool(ev.evdi_cards())
+    for status, label, detail in layout_checks(probe=probe_evdi_layout if can_probe else None):
+        if status == "info":
+            print(f"[..] {label}{(' — ' + detail) if detail else ''}")
+        else:
+            line(status == "ok", label, detail)
 
     from .usb.doctor import usb_checks
 

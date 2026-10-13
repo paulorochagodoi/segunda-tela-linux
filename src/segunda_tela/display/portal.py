@@ -121,6 +121,23 @@ def looks_like_primary(stream: PortalStream, expected_size: Optional[tuple[int, 
     return False
 
 
+def stream_is_output(
+    stream: PortalStream,
+    expected_size: Optional[tuple[int, int]],
+    output_pos: Optional[tuple[int, int]] = None,
+) -> bool:
+    """Does the portal stream show the output at `output_pos` (the EVDI one)?
+
+    With the compositor layout known, the stream position must match the
+    output's position. Without it, fall back to `looks_like_primary`.
+    """
+    if output_pos is not None and stream.position is not None:
+        if tuple(stream.position) != tuple(output_pos):
+            return False
+        return not (expected_size and stream.size and tuple(stream.size) != tuple(expected_size))
+    return not looks_like_primary(stream, expected_size)
+
+
 def pipewiresrc_fragment(fd: int, node_id: int, fps: int) -> str:
     # keepalive-time re-sends the last buffer when the compositor emits no damage.
     return (
@@ -152,6 +169,20 @@ def save_restore_token(key: str, token: Optional[str]) -> None:
     data[key] = token
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(data, indent=2))
+
+
+def forget_restore_token(key: str) -> bool:
+    """Drop a remembered portal choice (e.g. it resolved to eDP-1). True if one existed."""
+    path = _token_file()
+    try:
+        data = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return False
+    if not isinstance(data, dict) or key not in data:
+        return False
+    del data[key]
+    path.write_text(json.dumps(data, indent=2))
+    return True
 
 
 # ------------------------------------------------------------------ D-Bus

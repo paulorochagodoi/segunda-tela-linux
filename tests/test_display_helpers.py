@@ -13,7 +13,8 @@ from segunda_tela.display.virtual import evdi_modes, resolve_capture
 
 
 def test_resolve_capture():
-    assert resolve_capture("extend", "auto", wayland=True, x11=False) == "portal"
+    assert resolve_capture("extend", "auto", wayland=True, x11=False) == "evdi"  # never the portal by default
+    assert resolve_capture("extend", "portal", wayland=True, x11=False) == "portal"
     assert resolve_capture("extend", "auto", wayland=False, x11=True) == "evdi"
     assert resolve_capture("mirror", "auto", wayland=True, x11=False) == "portal"
     assert resolve_capture("mirror", "auto", wayland=False, x11=True) == "x11"

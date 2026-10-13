@@ -20,7 +20,7 @@ Galaxy Tab (sink Miracast)
  Wi-Fi Direct (NetworkManager, grupo p2p-wlo1-N, IP 192.168.49.x típico)
       │
  segunda-tela ── EVDI: conector virtual com EDID 1920x1200 / 2560x1600 / 1080p
-             └─ captura SÓ esse output (portal ScreenCast → PipeWire)
+             └─ captura SÓ esse output (leitura direta do EVDI; portal só como fallback)
              └─ vah264enc (VA-API amdgpu) → mpegtsmux → rtpmp2tpay → UDP
 ```
 
@@ -40,9 +40,36 @@ Notas sobre EVDI:
 - Usamos o **evdi-dkms** e a **libevdi1** da distro (código aberto da
   DisplayLink). O app só chama a libevdi via `ctypes`; não há módulo de kernel
   próprio.
-- Se o `doctor` disser *evdi kernel module* `!!` e você usa **Secure Boot**, o
-  módulo DKMS precisa estar assinado: `sudo mokutil --import /var/lib/dkms/mok.pub`
-  e reinicie (o MOK Manager pede a senha).
+- **Kernel mais novo que o pacote** (ex.: `evdi-dkms` 1.14.2 no kernel
+  `7.1.5-76070105-generic` falha com *linux-headers not supported*): o
+  `setup-evdi.sh` detecta a falha, remove o `evdi-dkms` quebrado, baixa o último
+  release de [DisplayLink/evdi](https://github.com/DisplayLink/evdi/releases)
+  e instala via DKMS (`dkms add` → `dkms build` → `dkms install`, em
+  `/usr/src/evdi-<versão>`), mais a `libevdi` do **mesmo** release em
+  `/usr/local/lib` (a `libevdi1` da distro é removida para não misturar
+  versões). Se o release também não compilar, tenta o branch `main`.
+  Forçar: `sudo EVDI_FROM_SOURCE=1 ./scripts/setup-evdi.sh`; versão fixa:
+  `sudo EVDI_REF=v1.15.1 ./scripts/setup-evdi.sh`. Log de build:
+  `/var/lib/dkms/evdi/<versão>/build/make.log`. O DKMS recompila sozinho a cada
+  kernel novo (`AUTOINSTALL=yes`).
+
+#### Secure Boot (MOK)
+
+Com Secure Boot ativo (`mokutil --sb-state`), o kernel só carrega módulos
+assinados por uma chave cadastrada no firmware. O DKMS assina o evdi com a
+chave dele (`/var/lib/shim-signed/mok/MOK.der` no Pop/Ubuntu, ou
+`/var/lib/dkms/mok.pub`); essa chave precisa ser cadastrada **uma vez**:
+
+1. `sudo mokutil --import /var/lib/shim-signed/mok/MOK.der` (ou o caminho que
+   o `setup-evdi.sh` mostrar) — crie uma senha temporária.
+2. Reinicie. Na tela azul **"Perform MOK management"**: *Enroll MOK* →
+   *Continue* → *Yes* → digite a senha → *Reboot*. (Se o boot passar direto
+   sem a tela azul, repita o passo 1.)
+3. `sudo modprobe evdi && segunda-tela doctor`.
+
+Sintoma de chave não cadastrada: `modprobe: ERROR: could not insert 'evdi':
+Key was rejected by service`. O `setup-evdi.sh` verifica com
+`mokutil --test-key`, imprime esses passos e oferece rodar o `--import`.
 - `setup-evdi.sh` grava `/etc/modprobe.d/segunda-tela-evdi.conf`
   (`initial_device_count=1`), `/etc/modules-load.d/segunda-tela-evdi.conf` e
   `/etc/udev/rules.d/70-segunda-tela-evdi.rules` (dá ao usuário da sessão
@@ -62,10 +89,13 @@ segunda-tela --mode extend --device "Galaxy Tab S9"
 O que acontece, na ordem:
 
 1. **EVDI**: aparece um monitor novo "Segunda Tela" para o COSMIC.
-2. **Portal**: o seletor do COSMIC abre — **escolha "Segunda Tela" (o
-   virtual), não o eDP-1**. Pedimos `persist_mode=2`; o token fica em
-   `~/.config/segunda-tela/portal.json` para não perguntar de novo (se o portal
-   do COSMIC suportar — ver Incertezas). Escolheu errado? apague esse arquivo.
+2. **Captura**: os quadros são lidos direto do EVDI (`evdi_grab_pixels`),
+   sem portal e sem diálogo — só o monitor virtual pode ser capturado.
+   Com `--capture portal` (ou se o EVDI não abrir) o seletor do COSMIC abre:
+   escolha "Segunda Tela". Uma escolha lembrada em
+   `~/.config/segunda-tela/portal.json` que aponte para o eDP-1 (ou outra
+   saída que não seja o EVDI) é apagada automaticamente e o seletor reabre;
+   se ainda assim vier a tela errada, voltamos para a leitura do EVDI.
 3. **Wi-Fi Direct**: o NetworkManager forma o grupo P2P (o tablet pode pedir
    para aceitar a conexão).
 4. **RTSP/WFD**: o tablet abre TCP 7236; negociamos o modo (preferimos
@@ -73,6 +103,11 @@ O que acontece, na ordem:
 5. **PLAY**: começa o vídeo.
 
 ### Organizar as telas (uma vez)
+
+Ao conectar, o app consulta o layout com `cosmic-randr list` (ou `wlr-randr`),
+registra todas as saídas no log e **avisa se a "Segunda Tela" está ausente,
+desligada ou espelhando/sobreposta ao eDP-1**. `segunda-tela doctor` faz o
+mesmo teste conectando o monitor virtual por alguns segundos.
 
 Na primeira vez, o COSMIC coloca o monitor virtual em algum lado do eDP-1.
 Abra **Configurações → Telas** e arraste "Segunda Tela" para a posição real do
@@ -85,8 +120,8 @@ a posição pelo EDID (nome/serial fixos), então isso deve ser uma vez só.
 
 | Opção | Efeito |
 |-------|--------|
-| `--capture evdi` | Lê os pixels direto do EVDI (sem portal, sem diálogo). Mais CPU (cópia), mas garante capturar só o monitor virtual. Use se o portal não persistir/escolher errado. |
-| `--capture portal` | Padrão no Wayland. |
+| `--capture evdi` | Padrão no modo estender: lê os pixels direto do EVDI (sem portal, sem diálogo). Falha em vez de cair no portal se o EVDI não abrir. |
+| `--capture portal` | Captura pelo portal ScreenCast (fallback; padrão no modo espelhar). |
 | `--width 1920 --height 1080` | Força modo (se o tablet anunciar). |
 | `--fps 30` | Limita fps (padrão 60 com VA-API, 30 com x264). |
 | `--encoder x264enc` | Força encoder por software. |
@@ -115,8 +150,10 @@ sudo ufw allow in on p2p-wlo1-0    # DHCP do grupo P2P (o nome pode ser p2p-wlo1
 | `list` vazio | Tablet na tela de recepção? `nmcli device` mostra `p2p-dev-wlo1`? `segunda-tela list --all` mostra algo sem WFD? |
 | Conecta P2P, mas nada no tablet | `-v`: chegou `RTSP sink connected`? Se não, firewall; se sim, veja qual M falhou. |
 | Tablet mostra preto | Log `gst:`; `segunda-tela doctor` (vah264enc presente?); tente `--encoder x264enc`. |
-| Capturou a tela errada | Apague `~/.config/segunda-tela/portal.json` ou use `--capture evdi`. |
+| Capturou a tela errada | Só acontece com `--capture portal`/fallback; rode sem `--capture` (padrão: EVDI) e veja o log `Captura:`. |
 | Monitor virtual não aparece | `segunda-tela doctor`; `ls /sys/bus/platform/devices/ | grep evdi`; `journalctl -b | grep -i evdi`. |
+| Log `EVDI: … ESPELHANDO …` / `sobrepõe eDP-1` | O COSMIC está espelhando em vez de estender: Configurações → Telas → arraste "Segunda Tela" para o lado do eDP-1 (modo "Juntar/Estender"). |
+| Log `EVDI: … NÃO aparece no layout` | O cosmic-comp não usou o card evdi. Confira `cosmic-randr list` e `journalctl --user -b | grep -i cosmic-comp`. |
 
 ## Incertezas (não verificadas em hardware)
 
@@ -148,14 +185,18 @@ sudo ufw allow in on p2p-wlo1-0    # DHCP do grupo P2P (o nome pode ser p2p-wlo1
 ## English summary
 
 1. `sudo ./scripts/install-deps-popos.sh && sudo ./scripts/setup-evdi.sh && ./scripts/install.sh`
-2. `segunda-tela doctor` → all `[ok]` (Secure Boot users: enroll the DKMS MOK key).
+2. `segunda-tela doctor` → all `[ok]`. If the distro `evdi-dkms` does not
+   build for your kernel, `setup-evdi.sh` falls back to the latest
+   DisplayLink/evdi GitHub release via DKMS (+ matching libevdi). With Secure
+   Boot: `sudo mokutil --import <key printed by the script>`, reboot, choose
+   *Enroll MOK* in the blue MokManager screen, enter the password.
 3. On the tablet open the wireless display receiver; `segunda-tela list`.
-4. `segunda-tela --mode extend --device "<tablet name>"` → pick **"Segunda Tela"**
-   (the virtual output) in the COSMIC portal dialog, accept the Wi-Fi Direct
-   prompt on the tablet.
+4. `segunda-tela --mode extend --device "<tablet name>"` → accept the Wi-Fi
+   Direct prompt on the tablet. No portal dialog: frames come straight from
+   the EVDI output.
 5. First time only: arrange the new display in COSMIC Settings → Displays.
 
-`--capture evdi` skips the portal and reads frames straight from the EVDI
-connector. Untested on real hardware: COSMIC portal persistence, COSMIC
+`--capture portal` uses the ScreenCast portal instead (fallback); a remembered
+portal choice that is not the EVDI output (e.g. eDP-1) is discarded. Untested on real hardware: COSMIC portal persistence, COSMIC
 accepting the EVDI card, MT7922 GO stability, and whether Smart View accepts a
 non-Samsung source for anything beyond mirroring.
