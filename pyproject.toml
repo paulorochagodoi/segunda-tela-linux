@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "segunda-tela-linux"
+version = "0.1.0"
+description = "Unofficial Wi-Fi Display (Miracast) source to use a tablet as a second screen on Linux / Pop!_OS"
+readme = "README.md"
+license = { text = "MIT" }
+authors = [{ name = "Paulo Godoi", email = "procha@techpartnersbr.com" }]
+requires-python = ">=3.10"
+dependencies = []
+
+[project.optional-dependencies]
+ui = ["PyGObject>=3.42"]
+dev = ["pytest>=7.0"]
+
+[project.scripts]
+segunda-tela = "segunda_tela.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

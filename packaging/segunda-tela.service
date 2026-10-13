@@ -1,0 +1,11 @@
+[Unit]
+Description=Segunda Tela para Linux (Miracast/WFD source)
+After=network-online.target graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/segunda-tela --mode extend
+Restart=on-failure
+
+[Install]
+WantedBy=default.target

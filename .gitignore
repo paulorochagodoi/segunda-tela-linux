@@ -1,0 +1,16 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+dist/
+build/
+*.egg-info/
+.msix/
+*.msix
+*.msixbundle
+*.Msixbundle
+/vendor-msix/
+*.log
+.DS_Store
+.idea/
+.vscode/
