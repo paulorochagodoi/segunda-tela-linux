@@ -14,6 +14,51 @@ import os
 import signal
 import sys
 import threading
+import time
+from typing import Callable, Optional
+
+
+class FpsMeter:
+    """Emit `stream fps …` once `interval` seconds of frames have elapsed."""
+
+    def __init__(self, interval: float = 5.0, now: Callable[[], float] = time.monotonic) -> None:
+        self.interval = interval
+        self._now = now
+        self.n = 0
+        self.t0 = now()
+
+    def tick(self, now: Optional[float] = None) -> Optional[str]:
+        self.n += 1
+        current = self._now() if now is None else now
+        dt = current - self.t0
+        if dt < self.interval or self.n <= 0:
+            return None
+        msg = f"stream fps {self.n / dt:.1f} ({self.n} frames in {dt:.1f}s)"
+        self.n = 0
+        self.t0 = current
+        return msg
+
+
+def attach_stream_fps_probe(pipeline, interval: float = 5.0) -> bool:
+    """Count encoded frames on `wfd-h264parse` and print fps every `interval`."""
+    from gi.repository import Gst
+
+    element = pipeline.get_by_name("wfd-h264parse")
+    if element is None:
+        return False
+    pad = element.get_static_pad("src")
+    if pad is None:
+        return False
+    meter = FpsMeter(interval)
+
+    def _probe(_pad, _info):
+        msg = meter.tick()
+        if msg:
+            print(msg, flush=True)
+        return Gst.PadProbeReturn.OK
+
+    pad.add_probe(Gst.PadProbeType.BUFFER, _probe)
+    return True
 
 
 def force_key_unit(pipeline) -> bool:
@@ -75,9 +120,14 @@ def main(argv: list[str] | None = None) -> int:
     except Exception as exc:  # noqa: BLE001 — GLib may raise GError
         print(f"parse_launch failed: {exc}", file=sys.stderr)
         return 1
-    # Same 500 ms latency gnome-network-displays sets on the pipeline
-    # (openh264 screen mode spikes; a short latency underruns the mux).
-    pipeline.set_latency(500 * Gst.MSECOND)
+    # 100 ms for VA / x264. openh264 screen mode still asks for 500 ms via
+    # SEGUNDA_TELA_LATENCY_MS. The old fixed 500 ms sat on top of the queues.
+    try:
+        latency_ms = max(0, int(os.environ.get("SEGUNDA_TELA_LATENCY_MS", "100")))
+    except ValueError:
+        latency_ms = 100
+    pipeline.set_latency(latency_ms * Gst.MSECOND)
+    attach_stream_fps_probe(pipeline)
 
     def _stop(*_args: object) -> None:
         pipeline.send_event(Gst.Event.new_eos())

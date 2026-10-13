@@ -26,6 +26,12 @@ log = logging.getLogger(__name__)
 
 MAX_DIRTY_RECTS = 16
 EVDI_AVAILABLE = 0  # enum evdi_device_status: AVAILABLE, UNRECOGNIZED, NOT_PRESENT
+# Memory order R,G,B,X. DRM XRGB8888 is B,G,R,X (GStreamer bgrx), but the
+# extended desktop on the Tab S10 FE showed red and blue swapped with bgrx:
+# a pixel whose first byte is red is blue when parsed as bgrx and red when
+# parsed as rgbx. libevdi's EvdiBuffer is a userspace pointer — no dma-buf
+# fd — so the encoder cannot import the grab zero-copy.
+EVDI_RAW_FORMAT = "rgbx"
 
 
 class EvdiError(RuntimeError):
@@ -83,6 +89,112 @@ SETUP_HINT = (
     "                                    # modprobe + initial_device_count=1 + udev; Secure Boot/MOK\n"
     "Ver docs/COSMIC.md."
 )
+
+
+def fourcc_str(value: int) -> str:
+    raw = bytes((value & 0xFF, (value >> 8) & 0xFF, (value >> 16) & 0xFF, (value >> 24) & 0xFF))
+    if all(32 <= b < 127 for b in raw):
+        return raw.decode("ascii")
+    return f"0x{value:08x}"
+
+
+def blit_damage(
+    dest: bytearray,
+    src: bytes | bytearray | memoryview,
+    width: int,
+    height: int,
+    rects: list[tuple[int, int, int, int]],
+) -> int:
+    """Copy dirty rectangles from `src` into `dest`. Returns bytes copied.
+
+    A region covering at least half the frame is one memcpy. Empty or
+    inverted rects copy nothing. Coordinates are clamped to the frame.
+    """
+    stride = width * 4
+    size = stride * height
+    if len(dest) < size:
+        raise ValueError("dest shorter than the frame")
+    src_mv = memoryview(src)
+    if src_mv.itemsize != 1 or src_mv.ndim != 1:
+        src_mv = src_mv.cast("B")
+    if len(src_mv) < size:
+        raise ValueError("src shorter than the frame")
+    norm: list[tuple[int, int, int, int]] = []
+    total = 0
+    for x1, y1, x2, y2 in rects:
+        x1 = 0 if x1 < 0 else width if x1 > width else x1
+        x2 = 0 if x2 < 0 else width if x2 > width else x2
+        y1 = 0 if y1 < 0 else height if y1 > height else y1
+        y2 = 0 if y2 < 0 else height if y2 > height else y2
+        if x2 <= x1 or y2 <= y1:
+            continue
+        total += (x2 - x1) * (y2 - y1) * 4
+        norm.append((x1, y1, x2, y2))
+    if not norm:
+        return 0
+    if total >= size // 2:
+        dest[:size] = src_mv[:size]
+        return size
+    copied = 0
+    for x1, y1, x2, y2 in norm:
+        row = (x2 - x1) * 4
+        for y in range(y1, y2):
+            off = y * stride + x1 * 4
+            dest[off:off + row] = src_mv[off:off + row]
+            copied += row
+    return copied
+
+
+class ShadowFrames:
+    """Two full frames. The grab paints into the buffer the feeder is not writing.
+
+    libevdi writes dirty rectangles into one registered userspace buffer (there
+    is no dma-buf to hand to vah264enc). Publishing that buffer directly would
+    tear. This keeps a stable copy for the feeder and only memcpys the damage,
+    or the whole frame when the spare copy is stale.
+    """
+
+    def __init__(self, width: int, height: int) -> None:
+        self.width = width
+        self.height = height
+        self.size = width * height * 4
+        self.shadows = [bytearray(self.size), bytearray(self.size)]
+        self.published = 0
+        self.reading: Optional[int] = None
+        self.missed = [True, True]
+        self.seq = 0
+
+    def apply(self, src: bytes | bytearray | memoryview, rects: list[tuple[int, int, int, int]]) -> bool:
+        """Fold `rects` from `src` into the shadow the feeder is not reading.
+
+        A stale shadow is replaced from the whole kernel buffer (that buffer
+        already contains every pixel; the rect list is only the latest damage).
+        """
+        if not rects:
+            return False
+        if self.reading is None:
+            target = self.published if not self.missed[self.published] else 0
+        else:
+            target = 1 - self.reading
+        if self.missed[target]:
+            blit_damage(self.shadows[target], src, self.width, self.height, [(0, 0, self.width, self.height)])
+            self.missed[target] = False
+        else:
+            blit_damage(self.shadows[target], src, self.width, self.height, rects)
+        if self.reading is not None:
+            self.missed[self.reading] = True
+        self.published = target
+        self.seq += 1
+        return True
+
+    def acquire(self) -> Optional[memoryview]:
+        if self.seq <= 0:
+            return None
+        self.reading = self.published
+        return memoryview(self.shadows[self.published])
+
+    def release(self) -> None:
+        self.reading = None
 
 
 def module_loaded(sys_root: Path = Path("/sys")) -> bool:
@@ -148,6 +260,7 @@ class EvdiMonitor:
         self.grab = grab
         self.fps = max(1, fps)
         self.mode: Optional[tuple[int, int, int]] = None  # w, h, refresh
+        self.pixel_format = 0
         self.dpms: Optional[int] = None
         self.on_mode_changed: Optional[Callable[[int, int, int], None]] = None
         self._lib: Optional[ctypes.CDLL] = None
@@ -155,13 +268,16 @@ class EvdiMonitor:
         self._thread: Optional[threading.Thread] = None
         self._running = False
         self._frame_lock = threading.Condition()
-        self._frame: Optional[bytes] = None
         self._frame_seq = 0
+        self._slots: Optional[ShadowFrames] = None
         self._buf = None
         self._buf_desc: Optional[EvdiBuffer] = None
         self._rects = (EvdiRect * MAX_DIRTY_RECTS)()
         self._buf_id = 1
         self._pending = False
+        self._stat_t0 = time.monotonic()
+        self._stat_grabs = 0
+        self._stat_frames = 0
         self._ctx = EvdiEventContext(
             dpms_handler=_DPMS_CB(self._on_dpms),
             mode_changed_handler=_MODE_CB(self._on_mode),
@@ -231,11 +347,23 @@ class EvdiMonitor:
         self.grab = True
 
     # -------------------------------------------------------------- frames
-    def wait_frame(self, after_seq: int, timeout: float) -> tuple[int, Optional[bytes]]:
+    def wait_frame(self, after_seq: int, timeout: float) -> tuple[int, Optional[memoryview]]:
+        """Return the latest stable frame. The caller must `release_frame`.
+
+        The memoryview aliases the published shadow. It is not copied. A
+        repeat of the previous frame (no new damage) returns that same buffer
+        so the feeder can keep a constant rate.
+        """
         with self._frame_lock:
             if self._frame_seq <= after_seq:
                 self._frame_lock.wait(timeout)
-            return self._frame_seq, self._frame
+            view = self._slots.acquire() if self._slots is not None else None
+            return self._frame_seq, view
+
+    def release_frame(self) -> None:
+        with self._frame_lock:
+            if self._slots is not None:
+                self._slots.release()
 
     # -------------------------------------------------------------- callbacks
     def _on_dpms(self, mode: int, _ud) -> None:
@@ -247,7 +375,12 @@ class EvdiMonitor:
 
     def _on_mode(self, mode: EvdiMode, _ud) -> None:
         self.mode = (mode.width, mode.height, mode.refresh_rate)
-        log.info("EVDI mode set by compositor: %sx%s@%s bpp=%s", mode.width, mode.height, mode.refresh_rate, mode.bits_per_pixel)
+        self.pixel_format = int(mode.pixel_format)
+        log.info(
+            "EVDI mode set by compositor: %sx%s@%s bpp=%s fourcc=%s (0x%08x); rawvideoparse format=%s",
+            mode.width, mode.height, mode.refresh_rate, mode.bits_per_pixel,
+            fourcc_str(self.pixel_format), self.pixel_format, EVDI_RAW_FORMAT,
+        )
         if self.grab:
             self._register_buffer(mode.width, mode.height)
         if self.on_mode_changed:
@@ -268,6 +401,7 @@ class EvdiMonitor:
             self._buf_id += 1
         stride = width * 4
         self._buf = (ctypes.c_char * (stride * height))()
+        self._slots = ShadowFrames(width, height)
         self._buf_desc = EvdiBuffer(
             self._buf_id,
             ctypes.cast(self._buf, ctypes.c_void_p),
@@ -281,21 +415,46 @@ class EvdiMonitor:
         self._pending = False
 
     def _grab_now(self) -> None:
-        if not (self._lib and self._handle and self._buf_desc is not None):
+        if not (self._lib and self._handle and self._buf_desc is not None and self._buf is not None):
             return
         n = ctypes.c_int(0)
+        # The ioctl copies only dirty rectangles into the registered buffer.
         self._lib.evdi_grab_pixels(self._handle, self._rects, ctypes.byref(n))
+        count = max(0, int(n.value))
+        rects = [
+            (int(self._rects[i].x1), int(self._rects[i].y1), int(self._rects[i].x2), int(self._rects[i].y2))
+            for i in range(min(count, MAX_DIRTY_RECTS))
+        ]
         with self._frame_lock:
-            self._frame = bytes(self._buf)
-            self._frame_seq += 1
-            self._frame_lock.notify_all()
+            self._stat_grabs += 1
+            if self._slots is not None and self._slots.apply(memoryview(self._buf), rects):
+                self._frame_seq = self._slots.seq
+                self._stat_frames += 1
+                self._frame_lock.notify_all()
+            self._log_grab_fps()
+
+    def _log_grab_fps(self) -> None:
+        now = time.monotonic()
+        dt = now - self._stat_t0
+        if dt < 5.0:
+            return
+        log.info(
+            "EVDI grab fps %.1f (%d grabs, %d updated frames in %.1fs, fourcc=%s, format=%s)",
+            self._stat_grabs / dt, self._stat_grabs, self._stat_frames, dt,
+            fourcc_str(self.pixel_format), EVDI_RAW_FORMAT,
+        )
+        self._stat_grabs = 0
+        self._stat_frames = 0
+        self._stat_t0 = now
 
     def _loop(self) -> None:
         assert self._lib and self._handle
         fd = self._lib.evdi_get_event_ready(self._handle)
-        interval = 1.0 / self.fps
         next_req = 0.0
         while self._running:
+            # Read each iteration so PLAY can drop 60 Hz grabbing to the
+            # negotiated 30 Hz without restarting the event thread.
+            interval = 1.0 / max(1, self.fps)
             if self.grab and self._buf_desc is None and self.mode is not None:
                 self._register_buffer(self.mode[0], self.mode[1])
             now = time.monotonic()
@@ -314,31 +473,49 @@ class EvdiMonitor:
 
 
 class EvdiFrameFeeder:
-    """Writes the latest EVDI frame (BGRx) to a pipe at a fixed rate."""
+    """Writes the latest EVDI frame (RGBx) to a pipe at a fixed rate.
+
+    The bytes are the shadow the monitor just published — no per-frame
+    `bytes()` copy. Release the shadow after the write so the next grab can
+    reuse it.
+    """
 
     def __init__(self, monitor: EvdiMonitor, width: int, height: int, fps: int) -> None:
         self.monitor = monitor
         self.frame_size = width * height * 4
-        self.fps = fps
+        self.fps = max(1, fps)
         self._stop = threading.Event()
 
     def __call__(self, pipe) -> None:
-        seq, last = 0, bytes(self.frame_size)
+        seq, blank = 0, bytes(self.frame_size)
         interval = 1.0 / self.fps
         warned = False
+        sent = 0
+        window = time.monotonic()
         try:
             while not self._stop.is_set():
                 t0 = time.monotonic()
-                seq, frame = self.monitor.wait_frame(seq, interval)
-                if frame is not None:
-                    if len(frame) == self.frame_size:
-                        last = frame
-                    elif not warned:
+                payload: bytes | memoryview = blank
+                try:
+                    seq, frame = self.monitor.wait_frame(seq, interval)
+                    if frame is not None and len(frame) == self.frame_size:
+                        payload = frame
+                    elif frame is not None and not warned:
                         log.warning("EVDI frame size changed; restart the stream to follow the new mode")
                         warned = True
-                pipe.write(last)
-                pipe.flush()
-                delay = interval - (time.monotonic() - t0)
+                    pipe.write(payload)
+                    pipe.flush()
+                    sent += 1
+                finally:
+                    release = getattr(self.monitor, "release_frame", None)
+                    if release is not None:
+                        release()
+                now = time.monotonic()
+                if now - window >= 5.0:
+                    log.info("EVDI feed fps %.1f (%d frames in %.1fs)", sent / (now - window), sent, now - window)
+                    sent = 0
+                    window = now
+                delay = interval - (now - t0)
                 if delay > 0:
                     time.sleep(delay)
         except (BrokenPipeError, ValueError, OSError):

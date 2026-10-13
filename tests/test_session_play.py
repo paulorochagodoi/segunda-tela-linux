@@ -12,16 +12,17 @@ class _Monitor:
 
     def __init__(self, width: int, height: int, fps: int) -> None:
         self.mode = (width, height, fps)
+        self.fps = fps
 
     def wait_frame(self, after_seq: int, timeout: float):
         return after_seq + 1, bytes(self.mode[0] * self.mode[1] * 4)
 
 
 def test_on_play_evdi_grab_uses_negotiated_bitrate():
-    width, height, fps = 320, 240, 30
-    session = SecondScreenSession(encoder="x264enc", fps=fps)
+    width, height = 320, 240
+    session = SecondScreenSession(encoder="x264enc", fps=60)
     session.display = VirtualDisplay(
-        width, height, "extend", "evdi-grab", fps=fps, evdi=_Monitor(width, height, fps)
+        width, height, "extend", "evdi-grab", fps=60, evdi=_Monitor(width, height, 60)
     )
     mode = find_mode(1280, 720, 30)
     assert mode is not None
@@ -41,7 +42,9 @@ def test_on_play_evdi_grab_uses_negotiated_bitrate():
         assert pipe.source.stdin_feeder is not None
         desc = pipe.description
         assert "fdsrc fd=0" in desc
-        assert "rawvideoparse" in desc and "format=bgrx" in desc
+        assert "rawvideoparse" in desc and "format=rgbx" in desc
+        assert "framerate=30/1" in desc
+        assert session.display.fps == 30 and session.display.evdi.fps == 30
         assert f"width={width}" in desc and f"height={height}" in desc
         assert "keepalive-time" not in desc and "rtpbin" not in desc
         assert pipe.running()

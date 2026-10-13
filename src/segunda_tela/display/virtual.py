@@ -53,7 +53,7 @@ class VirtualDisplay:
                 pass_fds=(self.portal.fd,),
             )
         if self.backend == "evdi-grab" and self.evdi is not None:
-            from .evdi import EvdiFrameFeeder
+            from .evdi import EVDI_RAW_FORMAT, EvdiFrameFeeder
 
             mon = self.evdi
             deadline = time.monotonic() + 5
@@ -67,7 +67,7 @@ class VirtualDisplay:
             return CaptureSource(
                 gst=(
                     f"fdsrc fd=0 blocksize={w * h * 4} do-timestamp=true ! "
-                    f"rawvideoparse use-sink-caps=false width={w} height={h} format=bgrx "
+                    f"rawvideoparse use-sink-caps=false width={w} height={h} format={EVDI_RAW_FORMAT} "
                     f"framerate={self.fps}/1"
                 ),
                 backend="evdi-grab",

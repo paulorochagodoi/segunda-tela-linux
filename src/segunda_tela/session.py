@@ -149,6 +149,12 @@ class SecondScreenSession:
         if self.usb_link and self.usb_link.transport.startswith("adb"):
             log.info("PLAY via adb — RTP/UDP may need USB tethering (adb reverse only carries TCP)")
         assert self.display is not None
+        # 720p60 is above H.264 level 3.1. Grab and parse at the negotiated
+        # rate (720p30 on the Tab S10 FE) instead of the EDID's 60 Hz.
+        self.display.fps = mode.fps
+        evdi = self.display.evdi
+        if evdi is not None and hasattr(evdi, "fps"):
+            evdi.fps = max(1, int(mode.fps))
         bitrate = self.bitrate_kbps or (
             negotiated.bitrate_kbps if negotiated else default_bitrate_kbps(mode.width, mode.height, mode.fps)
         )

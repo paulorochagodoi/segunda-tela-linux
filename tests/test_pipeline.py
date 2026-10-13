@@ -5,6 +5,7 @@ import pytest
 from segunda_tela.wfd.pipeline import (
     CaptureSource,
     StreamPipeline,
+    adapt_fragment,
     build_pipeline,
     default_bitrate_kbps,
     encoder_fragment,
@@ -23,7 +24,9 @@ def test_pick_encoder_order():
 
 def test_encoder_fragments():
     va = encoder_fragment("vah264enc", 4096, 30)
-    assert "qos=true" in va and "key-int-max=30" in va and "bitrate=4096" in va
+    assert "qos=false" in va and "key-int-max=30" in va and "bitrate=4096" in va
+    assert "rate-control=cbr" in va and "target-usage=7" in va
+    assert "b-frames=0" in va and "ref-frames=1" in va
     assert "cabac=false" in va and "dct8x8=false" in va and "num-slices=1" in va
     assert "max-bframes=0" in encoder_fragment("vaapih264enc", 4096, 30)
     x264 = encoder_fragment("x264enc", 4096, 30, level_idc=31)
@@ -43,7 +46,7 @@ def test_wfd_transport_is_mpegts_over_rtp():
     assert "rtph264pay" not in desc
     assert "rtpbin" not in desc  # sink sent RTCP port 0
     assert "constrained-baseline" in desc
-    assert "framerate=60/1,width=1920,height=1200" in desc
+    assert "framerate=60/1" in desc and "width=1920,height=1200" in desc
     assert "videorate drop-only=true" in desc and "skip-to-first" not in desc
     shlex.split(desc)
 
@@ -71,10 +74,12 @@ def test_stream_matches_gnome_network_displays():
     assert "pat-interval" not in desc and "pmt-interval" not in desc and "pcr-interval" not in desc
     assert "mpegtsmux name=mux alignment=7" in desc
     assert "rtpmp2tpay pt=33 ssrc=1 perfect-rtptime=false timestamp-offset=0 seqnum-offset=0" in desc
-    assert "udpsink host=10.42.0.120 port=19000" in desc and "sync=true" in desc
+    assert "udpsink host=10.42.0.120 port=19000" in desc and "sync=false" in desc
     assert "h264parse name=wfd-h264parse config-interval=-1" in desc
-    assert "videoscale qos=true" in desc and "videorate drop-only=true" in desc
-    assert "framerate=30/1,width=1280,height=720" in desc
+    assert "videorate drop-only=true" in desc
+    assert "videoscale n-threads=" in desc and "format=NV12" in desc
+    assert "latency=0" in desc and "leaky=downstream" in desc
+    assert "framerate=30/1" in desc and "width=1280,height=720" in desc
     assert "profile=(string){constrained-baseline,baseline}" in desc
     assert "pass=quant" in desc and 'option-string="level=3.1"' in desc
     assert "identity !" in desc
@@ -121,6 +126,16 @@ def test_stream_pipeline_accepts_legacy_string():
     sp = StreamPipeline("videotestsrc", "127.0.0.1", 19000, encoder="x264enc")
     assert isinstance(sp.source, CaptureSource)
     assert sp._build_cmd()[:3] == ["gst-launch-1.0", "-e", "-q"]
+
+
+def test_adapt_uses_vapostproc_for_va_and_i420_for_openh264():
+    gpu = adapt_fragment("vah264enc", 1280, 720, 30, available=lambda name: name == "vapostproc")
+    assert "vapostproc" in gpu and "format=NV12,width=1280,height=720" in gpu
+    assert "videoconvert" not in gpu and "videoscale" not in gpu
+    assert gpu.index("framerate=30/1") < gpu.index("vapostproc")
+    soft = adapt_fragment("openh264enc", 1280, 720, 30, available=lambda _name: False)
+    assert "format=I420" in soft and "videoconvert n-threads=" in soft
+    assert "videoscale" in soft and soft.index("videorate") < soft.index("videoscale")
 
 
 def test_bitrate_heuristic():
@@ -171,7 +186,7 @@ def test_encoded_transport_stream_is_h264_plus_aac(tmp_path):
         rtcp_port=19001, audio="AAC 00000001 00", profile="constrained-baseline", level_idc=31,
     )
     desc = re.sub(
-        r"udpsink host=\S+ port=\d+ bind-port=\d+ sync=true async=false",
+        r"udpsink host=\S+ port=\d+ bind-port=\d+ sync=false async=false",
         f"filesink location={dest} sync=false",
         desc,
         count=1,

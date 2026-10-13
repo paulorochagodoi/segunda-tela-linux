@@ -1,10 +1,15 @@
 """GStreamer encode + WFD media transport.
 
-The graph is the one gnome-network-displays builds in wfd-media-factory.c:
-videoscale → framerate caps → videoconvert → queue(1) → encoder → identity →
-h264parse config-interval=-1 → byte-stream caps → queue(500 ms) →
-mpegtsmux alignment=7 sink_4113, audio on sink_4352, rtpmp2tpay ssrc=1
-perfect-rtptime=false. `rtpbin` is not used.
+The graph follows gnome-network-displays (wfd-media-factory.c):
+videorate → scale/NV12 → queue(1, leaky) → encoder → identity →
+h264parse config-interval=-1 → byte-stream caps → small queue →
+mpegtsmux alignment=7 latency=0 sink_4113, audio on sink_4352, rtpmp2tpay
+ssrc=1 perfect-rtptime=false, udpsink sync=false. `rtpbin` is not used.
+
+EVDI has no dma-buf. When `vapostproc` is installed it uploads, scales and
+converts to NV12 on the GPU for `vah264enc`. Otherwise `videoscale` and
+`videoconvert` run with a few threads and the encoder receives NV12 (I420
+for openh264, which only accepts that).
 
 `pipewiresrc keepalive-time>0` unrefs a NULL last-buffer on the first frame
 (gstpipewiresrc, PipeWire commit 6c25924). The capture fragment may set that
@@ -123,8 +128,12 @@ def encoder_fragment(
     cabac = "true" if high else "false"
     dct = "true" if high else "false"
     if encoder == "vah264enc":
+        # target-usage 7 is the fastest step (1..7). CBR, no B frames, one
+        # reference, GOP = one second. qos off so the encoder does not add
+        # its own latency wait on top of the pipeline latency.
         return (
-            f"vah264enc qos=true key-int-max={gop} num-slices=1 "
+            f"vah264enc qos=false rate-control=cbr target-usage=7 "
+            f"key-int-max={gop} b-frames=0 ref-frames=1 num-slices=1 "
             f"cabac={cabac} dct8x8={dct} bitrate={bitrate_kbps}"
         )
     if encoder == "vaapih264enc":
@@ -170,10 +179,15 @@ def _audio_kind(audio: Optional[str]) -> Optional[str]:
 
 def _audio_branch(kind: str, audio_source: Optional[str]) -> str:
     # Order matches wfd_media_factory_create_audio_element: resample, convert,
-    # encoder, then a 500 ms queue onto PID 0x1100. Caps are channels + rate only.
+    # encoder, then a short queue onto PID 0x1100. Caps are channels + rate only.
     src = audio_source or SILENT_AUDIO_SOURCE
     head = f"{src} ! audioresample ! audioconvert"
-    queue = f"queue max-size-buffers=100000 max-size-time=500000000 leaky=0 ! mux.sink_{AUDIO_PID}"
+    # Short, non-leaky: dropping AAC mid-stream makes the sink declare the
+    # audio elementary stream broken. 80 ms is four AAC frames.
+    queue = (
+        f"queue max-size-buffers=4 max-size-bytes=0 max-size-time=80000000 leaky=0 "
+        f"! mux.sink_{AUDIO_PID}"
+    )
     if kind == "lpcm":
         return (
             f"{head} ! audio/x-raw,format=S16LE,rate=48000,channels=2 ! "
@@ -182,6 +196,46 @@ def _audio_branch(kind: str, audio_source: Optional[str]) -> str:
             f'dynamic_range=(int)0,emphasis=(boolean)false,mute=(boolean)false" ! {queue}'
         )
     return f"{head} ! avenc_aac ! audio/mpeg,channels=2,rate=48000 ! {queue}"
+
+
+def convert_threads() -> int:
+    return max(1, min(4, os.cpu_count() or 1))
+
+
+def adapt_fragment(
+    encoder: str,
+    width: int,
+    height: int,
+    fps: int,
+    available: Callable[[str], bool] = gst_element_available,
+) -> str:
+    """Drop to `fps` first, then scale and convert.
+
+    Scaling every grabbed frame and converting afterwards was the expensive
+    order (60 Hz 1920x1200 → 30 Hz 720p). `vapostproc` does both on the GPU
+    and leaves NV12 in VA memory for vah264enc. There is no EVDI dma-buf to
+    import, so this upload is the zero-copy step we can actually do.
+    """
+    threads = convert_threads()
+    rate = f"videorate drop-only=true qos=false ! video/x-raw,framerate={fps}/1"
+    if encoder == "vah264enc" and available("vapostproc"):
+        return (
+            f"{rate} ! vapostproc ! "
+            f"video/x-raw,format=NV12,width={width},height={height}"
+        )
+    if encoder == "vaapih264enc" and available("vaapipostproc"):
+        # The encoder fragment already starts with vaapipostproc.
+        return (
+            f"{rate} ! videoscale n-threads={threads} qos=false ! "
+            f"video/x-raw,width={width},height={height}"
+        )
+    # openh264enc accepts only I420. NV12 is what VA encoders want; x264 takes both.
+    pixel = "I420" if encoder == "openh264enc" else "NV12"
+    return (
+        f"{rate} ! videoscale n-threads={threads} qos=false ! "
+        f"video/x-raw,width={width},height={height} ! "
+        f"videoconvert n-threads={threads} qos=false ! video/x-raw,format={pixel}"
+    )
 
 
 def sanitize_capture_gst(gst: str) -> str:
@@ -221,22 +275,21 @@ def build_pipeline(
         # A set avoids a semicolon, which gst-launch would treat as a new element.
         codec_caps = "video/x-h264,stream-format=byte-stream,profile=(string){constrained-baseline,baseline}"
     capture = sanitize_capture_gst(source.gst)
-    # drop-only videorate turns a 60 fps portal node into the negotiated rate.
-    # GND has no videorate because its source already negotiates that rate.
+    # Raw frames may be dropped (leaky=downstream). Encoded frames may not:
+    # a missing P-frame is garbage until the next IDR.
     video = (
-        f"{capture} ! videoscale qos=true ! videorate drop-only=true ! "
-        f"video/x-raw,framerate={fps}/1,width={width},height={height} ! "
-        f"videoconvert qos=true ! queue max-size-buffers=1 leaky=0 ! "
+        f"{capture} ! {adapt_fragment(encoder, width, height, fps)} ! "
+        f"queue max-size-buffers=1 max-size-bytes=0 max-size-time=0 leaky=downstream ! "
         f"{encoder_fragment(encoder, bitrate_kbps, fps, profile, level_idc)} ! "
         f"identity ! h264parse name=wfd-h264parse config-interval=-1 ! "
         f"{codec_caps} ! "
-        f"queue max-size-buffers=1000 max-size-time=500000000 ! mux.sink_{VIDEO_PID}"
+        f"queue max-size-buffers=2 max-size-bytes=0 max-size-time=0 leaky=0 ! mux.sink_{VIDEO_PID}"
     )
     transport = (
-        f"mpegtsmux name=mux alignment=7 ! "
-        f"queue max-size-buffers=1 leaky=0 ! "
+        f"mpegtsmux name=mux alignment=7 latency=0 ! "
+        f"queue max-size-buffers=2 max-size-bytes=0 max-size-time=0 leaky=0 ! "
         f"rtpmp2tpay pt=33 ssrc=1 perfect-rtptime=false timestamp-offset=0 seqnum-offset=0 ! "
-        f"udpsink host={dest_host} port={rtp_port} bind-port={local_rtp_port} sync=true async=false"
+        f"udpsink host={dest_host} port={rtp_port} bind-port={local_rtp_port} sync=false async=false"
     )
     parts = [video, transport]
     kind = _audio_kind(audio) or (_audio_kind("aac") if audio_source else None)
@@ -335,9 +388,9 @@ class StreamPipeline:
             if self._proc and self._proc.poll() is None:
                 return
             if gst_bindings_available() and self._spawn(self._runner_cmd()):
-                log.info("Streaming %sx%s@%s via %s (%s kbps, %s) → %s:%s RTP/MP2T",
+                log.info("Streaming %sx%s@%s via %s (%s kbps, %s, latency %sms) → %s:%s RTP/MP2T",
                          self.width, self.height, self.fps, self.encoder, self.bitrate_kbps,
-                         self.profile, self.dest_host, self.dest_port)
+                         self.profile, self._latency_ms(), self.dest_host, self.dest_port)
                 return
             if not shutil.which("gst-launch-1.0"):
                 raise RuntimeError(
@@ -350,6 +403,10 @@ class StreamPipeline:
                      self.profile, self.dest_host, self.dest_port)
             if not self._spawn(self._build_cmd()):
                 raise RuntimeError("failed to start GStreamer")
+
+    def _latency_ms(self) -> int:
+        # openh264 screen mode spikes; VA and x264 ultrafast stay inside 100 ms.
+        return 500 if self.encoder == "openh264enc" else 100
 
     def _runner_cmd(self) -> Optional[list[str]]:
         read_fd, write_fd = os.pipe()
@@ -379,6 +436,9 @@ class StreamPipeline:
             extra = (read_fd,)
         env = os.environ.copy()
         env["SEGUNDA_TELA_PIPELINE"] = self.description
+        # openh264 screen mode used to need 500 ms. VA and x264 ultrafast
+        # stay ahead of 100 ms, which is the latency the child applies.
+        env["SEGUNDA_TELA_LATENCY_MS"] = str(self._latency_ms())
         log.debug("Pipeline: %s", self.description)
         try:
             proc = subprocess.Popen(
@@ -421,7 +481,11 @@ class StreamPipeline:
         assert proc.stdout is not None
         for raw in proc.stdout:
             line = raw.decode("utf-8", "replace").rstrip()
-            if line:
+            if not line:
+                continue
+            if line.startswith("stream fps"):
+                log.info("gst: %s", line)
+            else:
                 log.warning("gst: %s", line)
         code = proc.wait()
         if code not in (0, -15):
