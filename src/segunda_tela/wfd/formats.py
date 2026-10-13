@@ -360,6 +360,15 @@ class SinkCaps:
     raw: dict[str, str] = field(default_factory=dict)
 
     @property
+    def content_protection(self) -> str:
+        """Sink's wfd_content_protection answer ("" when not asked / not sent)."""
+        return self.raw.get("wfd_content_protection", "").strip()
+
+    @property
+    def offers_hdcp(self) -> bool:
+        return self.content_protection.upper().startswith("HDCP")
+
+    @property
     def supports_aac(self) -> bool:
         return any(a.name == "AAC" and a.modes & AAC_48K_2CH for a in self.audio)
 
@@ -378,15 +387,40 @@ def parse_sink_caps(body: str) -> SinkCaps:
 
 # ------------------------------------------------------------ negotiation
 
+# Same set gnome-network-displays queries (it mirrors to Galaxy tablets fine).
+# `wfd_content_protection` is deliberately *not* asked for: we never run HDCP,
+# and a Samsung sink that is asked for it and answers HDCP2.x then expects an
+# HDCP session and shows "can't display content because it's not secure".
 M3_QUERY_KEYS = (
     "wfd_video_formats",
     "wfd_audio_codecs",
     "wfd_client_rtp_ports",
     "wfd_display_edid",
-    "wfd_connector_type",
-    "wfd_content_protection",
     "wfd_idr_request_capability",
 )
+M3_HDCP_PROBE_KEY = "wfd_content_protection"
+
+# Every parameter defined by WFD R1/R2; anything else a sink sends is vendor-specific.
+STANDARD_PARAMS = frozenset({
+    "wfd_audio_codecs", "wfd_video_formats", "wfd_3d_video_formats", "wfd_content_protection",
+    "wfd_display_edid", "wfd_coupled_sink", "wfd_trigger_method", "wfd_presentation_url",
+    "wfd_client_rtp_ports", "wfd_route", "wfd_i2c", "wfd_av_format_change_timing",
+    "wfd_preferred_display_mode", "wfd_uibc_capability", "wfd_uibc_setting",
+    "wfd_standby_resume_capability", "wfd_standby", "wfd_connector_type", "wfd_idr_request",
+    "wfd_idr_request_capability", "wfd2_audio_codecs", "wfd2_video_codecs",
+    "wfd2_aux_stream_formats", "wfd2_buffer_length", "wfd2_audio_playback_status",
+    "wfd2_video_playback_status", "wfd2_cta_datablock_collection",
+})
+
+
+def m3_query_keys(probe_hdcp: bool = False) -> tuple[str, ...]:
+    """Keys for the M3 GET_PARAMETER body. `probe_hdcp` adds wfd_content_protection (diagnostics only)."""
+    return M3_QUERY_KEYS + ((M3_HDCP_PROBE_KEY,) if probe_hdcp else ())
+
+
+def vendor_params(params: dict[str, str]) -> dict[str, str]:
+    """Non-standard (e.g. Samsung-specific) keys in a sink's parameter set."""
+    return {k: v for k, v in params.items() if k not in STANDARD_PARAMS}
 
 
 @dataclass(frozen=True)

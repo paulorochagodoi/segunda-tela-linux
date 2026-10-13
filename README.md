@@ -107,6 +107,26 @@ Bluetooth (MCF), que não reproduzimos — abra a “Segunda tela” no painel
 rápido antes. Se não atender, use Wi-Fi Direct (`--device`). Detalhes:
 [docs/USB.md](docs/USB.md).
 
+### Log e «não é possível exibir o conteúdo porque não é seguro»
+
+Todo start grava um log de depuração rotativo em
+`~/.local/state/segunda-tela/segunda-tela.log` (o caminho aparece na
+primeira linha), com a troca RTSP M1–M16 **literal**: inclusive a resposta do
+tablet ao M3 (`wfd_video_formats`, `wfd_audio_codecs`, `wfd_client_rtp_ports`,
+`wfd_content_protection` e parâmetros próprios da Samsung). `--dump-rtsp`
+mostra a mesma troca no terminal, e `--log-file` muda o caminho.
+
+Até a v0.3.2 o M3 perguntava `wfd_content_protection`. Os tablets Galaxy
+respondem `HDCP2.x port=…` e então esperam uma sessão HDCP (é o que o
+Miracast do Windows faz, na porta 25030). Como nunca fazemos HDCP, o tablet
+recusava com «não é seguro». A partir da 0.3.3 fazemos como o
+gnome-network-displays: o padrão (`--no-hdcp`) não menciona proteção de
+conteúdo no M3 nem no M4. `--probe-hdcp` só serve para diagnóstico.
+
+O aviso `dnsmasq … CAP_CHOWN` no journal vem do dnsmasq que o NetworkManager
+sobe para o grupo P2P (DHCP do tablet). Ele é inofensivo: o tablet recebe o IP
+normalmente.
+
 ## Análise do app Windows
 
 O app da Store `Segunda tela` (9PLTXW5DX5KB) foi inspecionado com
@@ -173,6 +193,16 @@ don't reproduce, so open "Second screen" on the tablet first; Wi-Fi Direct
 (`--device`) remains the fallback. `segunda-tela doctor` has a USB section
 (adb, authorization, tether iface/IP, peer reachability, ports). Details:
 [docs/USB.md](docs/USB.md). Samsung's MCF one-tap pairing is out of scope.
+
+Content protection (0.3.3): Galaxy sinks answer `wfd_content_protection:
+HDCP2.x port=…` when M3 asks for it, then expect an HDCP session (Windows'
+Miracast stack runs HDCP 2.x on port 25030). We never do HDCP, so the tablet
+showed "can't display content because it's not secure". Like
+gnome-network-displays, M3 and M4 now leave content protection out entirely
+(`--no-hdcp`, the default). `--probe-hdcp` only asks, for diagnostics. Every run
+writes a rotating debug log, `~/.local/state/segunda-tela/segunda-tela.log`,
+with the verbatim RTSP exchange. `--dump-rtsp` echoes that exchange to the
+console.
 
 License: MIT. Wi-Fi P2P/WFD behaviour was studied in GNOME Network Displays
 (GPL-3.0) as a reference only; no GND code was copied — see [NOTICE](NOTICE).

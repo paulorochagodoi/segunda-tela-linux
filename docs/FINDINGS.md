@@ -174,3 +174,36 @@ Evidence (`Samsung.SecondScreen.Usb`, P/Invoke to `ss_conn_lib2.dll`, strings):
 **Linux clean-room mirror:** obtain an IP interface via RNDIS/NCM tether or adb,
 then run the same open WFD RTSP source. Do **not** ship Connlib. Details:
 [`docs/USB.md`](USB.md).
+
+## Content protection / "not secure" on the tablet (v0.3.3)
+
+Symptom (real test, Galaxy Tab S10 FE 5G over Wi-Fi Direct): the session got
+through RTSP, and then the **tablet** showed "não é possível exibir o
+conteúdo porque não é seguro". gnome-network-displays mirrors to the same
+tablet without that error.
+
+Evidence:
+
+* The Samsung Windows app has no `wfd_*` strings at all. The WFD
+  RTSP/M3/M4 exchange comes from Windows' own Miracast source (see the USB
+  findings: `StartProjectingAsync` → OS projection API). Samsung's code only
+  maps an **`HdcpPort` = 25030** (PC connects to the tablet) next to RTSP/RTP.
+  So the reference source the tablet is tuned for always runs HDCP 2.x.
+  Content-protection strings in `WrapperStreamClient.dll` belong to Media
+  Foundation's protection API, not to WFD.
+* gnome-network-displays' M3 asks only for `wfd_client_rtp_ports`,
+  `wfd_audio_codecs`, `wfd_video_formats`, `wfd_display_edid`,
+  `wfd_idr_request_capability` (and `microsoft_cursor`). Its M4 sends only
+  video/audio formats, presentation URL and RTP ports. It **never** mentions
+  `wfd_content_protection`.
+* Our M3 up to v0.3.2 also asked for `wfd_content_protection` (and
+  `wfd_connector_type`). Most likely mechanism (inferred, not yet confirmed
+  from a tablet log): a source asks for that parameter when
+  it intends to protect the stream. The sink answers `HDCP2.x port=N`, then
+  waits for HDCP AKE. Since none happens, it flags the content as insecure.
+
+Fix: the default M3 is the gnome-network-displays key set. M4 never carries
+`wfd_content_protection`, and the code asserts that. `--probe-hdcp` restores
+the query for diagnostics only. The full M1–M16 exchange is written verbatim
+to `~/.local/state/segunda-tela/segunda-tela.log` so the next real-device
+test confirms (or refutes) this from the tablet's actual M3 answer.

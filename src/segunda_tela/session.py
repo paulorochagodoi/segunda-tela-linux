@@ -32,6 +32,7 @@ class SecondScreenSession:
         capture: str = "auto",
         encoder: str = "auto",
         audio: bool = False,
+        probe_hdcp: bool = False,
     ) -> None:
         self.want_size = (width, height) if width and height else None
         self.mode = mode
@@ -44,6 +45,7 @@ class SecondScreenSession:
         self.encoder = pick_encoder(encoder)
         self.fps = fps or (60 if self.encoder in HW_ENCODERS else 30)
         self.audio = audio
+        self.probe_hdcp = probe_hdcp
         self.display: Optional[VirtualDisplay] = None
         self.server: Optional[WfdRtspServer] = None
         self.pipeline: Optional[StreamPipeline] = None
@@ -82,6 +84,10 @@ class SecondScreenSession:
         self.p2p_link = link
         if link is not None and link.local_ip:
             self.advertise_ip = link.local_ip
+            log.info("P2P group up on %s (%s). NetworkManager runs its own dnsmasq for the tablet's DHCP; "
+                     "a dnsmasq CAP_CHOWN warning in the journal is harmless (dnsmasq only fails to drop/"
+                     "keep a privilege it does not need here; DHCP still serves the tablet).",
+                     link.interface, link.local_ip)
 
     def start_usb_initiator(self, **kw):
         """USB: dial the tablet's sink (adb/tether) instead of only waiting for it."""
@@ -124,6 +130,7 @@ class SecondScreenSession:
             want_size=self.want_size,
             max_fps=self.fps,
             audio=self.audio,
+            probe_hdcp=self.probe_hdcp,
         )
         self.server.start_background()
 

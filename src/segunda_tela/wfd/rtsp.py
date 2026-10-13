@@ -48,6 +48,7 @@ from .formats import (  # re-exported for backwards compatibility
     H264_PROFILE_CBP,
     H264_PROFILE_CHP,
     LEVEL_IDC,
+    M3_HDCP_PROBE_KEY,
     M3_QUERY_KEYS,
     Negotiated,
     SinkCaps,
@@ -55,12 +56,14 @@ from .formats import (  # re-exported for backwards compatibility
     cea_bitmap,
     cea_native_index,
     h264_level_for,
+    m3_query_keys,
     m4_video_descriptor,
     negotiate,
     parse_client_rtp_ports,
     parse_parameters,
     parse_sink_caps,
     requested_keys,
+    vendor_params,
     wfd_audio_codecs,
     wfd_video_formats,
 )
@@ -73,6 +76,8 @@ __all__ = [
 ]
 
 log = logging.getLogger(__name__)
+# Verbatim RTSP traffic at DEBUG: always in the log file, on the console with --dump-rtsp / -v.
+wire_log = logging.getLogger(__name__ + ".wire")
 
 WFD_DEFAULT_PORT = 7236
 KEEPALIVE_S = 25
@@ -88,6 +93,7 @@ class RtspMessage:
     first_line: str
     headers: dict[str, str] = field(default_factory=dict)  # lower-case keys
     body: str = ""
+    raw: str = ""  # message exactly as received (for the wire log)
 
     @property
     def is_response(self) -> bool:
@@ -148,7 +154,13 @@ class MessageReader:
         if len(rest) < clen:
             return None
         body, self.buf = rest[:clen], rest[clen:]
-        return RtspMessage(lines[0].strip(), headers, body.decode("utf-8", "replace"))
+        raw = (head + b"\r\n\r\n" + body).decode("utf-8", "replace")
+        return RtspMessage(lines[0].strip(), headers, body.decode("utf-8", "replace"), raw)
+
+
+def _wire(direction: str, peer: str, text: str) -> None:
+    if wire_log.isEnabledFor(logging.DEBUG):
+        wire_log.debug("%s %s\n%s", direction, peer, text.replace("\r\n", "\n").rstrip("\n"))
 
 
 # ------------------------------------------------------------------ session
@@ -214,8 +226,12 @@ class _Handler(socketserver.BaseRequestHandler):
         self._closing = False
 
     def _send(self, data: bytes) -> None:
+        _wire(">>> to", self._peer_label(), data.decode("utf-8", "replace"))
         with self._send_lock:
             self.sock.sendall(data)
+
+    def _peer_label(self) -> str:
+        return f"{self.client_address[0]}:{self.client_address[1]}"
 
     def _request(self, method: str, url: str, purpose: str, body: str = "", extra: Optional[dict] = None) -> None:
         self._cseq += 1
@@ -224,8 +240,6 @@ class _Handler(socketserver.BaseRequestHandler):
             headers.update(extra)
         self._pending[str(self._cseq)] = purpose
         log.info("→ %s %s (CSeq %s, %s)", method, url, self._cseq, purpose)
-        if body:
-            log.debug("   body: %r", body)
         self._send(encode_message(f"{method} {url} RTSP/1.0", headers, body))
 
     def _reply(self, msg: RtspMessage, code: int = 200, reason: str = "OK", extra: Optional[dict] = None, body: str = "") -> None:
@@ -295,6 +309,7 @@ class _Handler(socketserver.BaseRequestHandler):
             while not self._closing:
                 msg = self.reader.pop()
                 if msg is not None:
+                    _wire("<<< from", self._peer_label(), msg.raw)
                     self._dispatch(msg)
                     continue
                 try:
@@ -324,7 +339,7 @@ class _Handler(socketserver.BaseRequestHandler):
         if self._m3_sent:
             return
         self._m3_sent = True
-        body = "\r\n".join(M3_QUERY_KEYS) + "\r\n"
+        body = "\r\n".join(m3_query_keys(self.server.probe_hdcp)) + "\r\n"
         self._request("GET_PARAMETER", "rtsp://localhost/wfd1.0", "M3", body=body,
                       extra={"Content-Type": "text/parameters"})
 
@@ -338,6 +353,8 @@ class _Handler(socketserver.BaseRequestHandler):
             lines.append(f"wfd_audio_codecs: {n.audio}")
         lines.append(f"wfd_presentation_URL: {st.url} none")
         lines.append(f"wfd_client_rtp_ports: RTP/AVP/UDP;unicast {st.rtp_port} {st.rtcp_port} mode=play")
+        # No wfd_content_protection here, ever: naming it in M4 selects HDCP, which we don't implement.
+        assert not any(line.startswith(M3_HDCP_PROBE_KEY) for line in lines)
         self._request("SET_PARAMETER", "rtsp://localhost/wfd1.0", "M4", body="\r\n".join(lines) + "\r\n",
                       extra={"Content-Type": "text/parameters"})
 
@@ -361,7 +378,7 @@ class _Handler(socketserver.BaseRequestHandler):
             if msg.status != 200:
                 log.warning("M3 rejected (%s); using fallback caps", msg.status)
             st.sink = parse_sink_caps(msg.body)
-            log.info("sink caps: %s", {k: v for k, v in st.sink.raw.items() if k != "wfd_display_edid"})
+            self._log_sink_caps(st.sink)
             st.rtp_port, st.rtcp_port = st.sink.rtp_port, st.sink.rtcp_port
             st.negotiated = srv.negotiate(st.sink)
             log.info("negotiated %s level=0x%02x audio=%s (%s); RTP→%s:%s RTCP=%s",
@@ -382,6 +399,21 @@ class _Handler(socketserver.BaseRequestHandler):
                 self._send_m4()
             else:
                 log.error("sink rejected M4 (%s); giving up", msg.status)
+
+    def _log_sink_caps(self, sink: SinkCaps) -> None:
+        raw = sink.raw
+        for key in ("wfd_video_formats", "wfd_audio_codecs", "wfd_client_rtp_ports",
+                    "wfd_content_protection", "wfd_idr_request_capability"):
+            if key in raw:
+                log.info("M3 sink %s: %s", key, raw[key])
+        if "wfd_display_edid" in raw:
+            log.info("M3 sink wfd_display_edid: %s", "present" if sink.edid else raw["wfd_display_edid"])
+        extra = vendor_params(raw)
+        if extra:
+            log.info("M3 sink vendor-specific params: %s", extra)
+        if sink.offers_hdcp:
+            log.warning("sink offers content protection (%s); we do not negotiate HDCP — "
+                        "M4 omits wfd_content_protection, stream is unencrypted", sink.content_protection)
 
     def _dispatch(self, msg: RtspMessage) -> None:
         if msg.is_response:
@@ -528,6 +560,7 @@ class WfdRtspServer(socketserver.ThreadingTCPServer):
         max_fps: int = 60,
         max_pixels: int = 1920 * 1200,
         audio: bool = False,
+        probe_hdcp: bool = False,
         m1_delay_s: float = 0.5,
         keepalive_s: float = KEEPALIVE_S,
     ) -> None:
@@ -545,6 +578,7 @@ class WfdRtspServer(socketserver.ThreadingTCPServer):
         self.max_fps = max_fps
         self.max_pixels = max_pixels
         self.audio = audio
+        self.probe_hdcp = probe_hdcp  # only *ask* the sink about HDCP (diagnostics); never select it
         self.m1_delay_s = m1_delay_s
         self.keepalive_s = keepalive_s
         # RTP destination for sinks that reach us via loopback (`adb reverse`):

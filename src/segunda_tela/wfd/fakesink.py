@@ -87,6 +87,8 @@ def run_fake_sink(
     audio_codecs: str = TABLET_AUDIO,
     rtp_ports: str = "RTP/AVP/UDP;unicast 19000 0 mode=play",
     display_edid: str = "none",
+    content_protection: str = "none",
+    vendor: dict[str, str] | None = None,
     wait_keepalive: bool = False,
     timeout: float = 5.0,
     sock: Optional[socket.socket] = None,
@@ -109,11 +111,13 @@ def run_fake_sink(
             "wfd_client_rtp_ports": rtp_ports,
             "wfd_display_edid": display_edid,
             "wfd_connector_type": "05",
-            "wfd_content_protection": "none",
+            "wfd_content_protection": content_protection,
             "wfd_idr_request_capability": "1",
         }
         keys = [k.strip() for k in res.m3.body.splitlines() if k.strip()]
-        s.reply(res.m3, body="".join(f"{k}: {answers[k]}\r\n" for k in keys if k in answers))
+        body = "".join(f"{k}: {answers[k]}\r\n" for k in keys if k in answers)
+        body += "".join(f"{k}: {v}\r\n" for k, v in (vendor or {}).items())
+        s.reply(res.m3, body=body)
 
         res.m4 = s.expect_request("SET_PARAMETER")
         res.m4_params = parse_parameters(res.m4.body)

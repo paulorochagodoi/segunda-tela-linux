@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import logging
 import signal
 import sys
 import time
@@ -28,6 +29,18 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     p.add_argument("-v", "--verbose", action="store_true")
+    p.add_argument("--dump-rtsp", action="store_true",
+                   help="Print every RTSP request/response (M1–M16) verbatim on the console "
+                        "(always written to the log file)")
+    p.add_argument("--log-file", metavar="PATH",
+                   help="Debug log file (default ~/.local/state/segunda-tela/segunda-tela.log, rotated)")
+    hdcp = p.add_mutually_exclusive_group()
+    hdcp.add_argument("--no-hdcp", dest="probe_hdcp", action="store_false",
+                      help="Never mention content protection to the sink (default; same as gnome-network-displays)")
+    hdcp.add_argument("--probe-hdcp", dest="probe_hdcp", action="store_true",
+                      help="Diagnostics: also query wfd_content_protection in M3 (HDCP is still never selected; "
+                           "some Samsung sinks then refuse with 'not secure')")
+    p.set_defaults(probe_hdcp=False)
     p.add_argument("--width", type=int, default=None, help="Stream/monitor width (default: negotiate, monitor 1920)")
     p.add_argument("--height", type=int, default=None, help="Stream/monitor height (default: negotiate, monitor 1200)")
     p.add_argument("--fps", type=int, default=None, help="Max fps (default 60 with VAAPI, 30 with x264)")
@@ -172,7 +185,11 @@ def cmd_doctor(_args) -> int:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
-    setup_logging(args.verbose)
+    log_path = setup_logging(args.verbose, dump_rtsp=args.dump_rtsp, log_file=args.log_file)
+    if log_path:
+        print(f"Log: {log_path}", file=sys.stderr, flush=True)
+    logging.getLogger("segunda_tela").info("%s v%s argv=%s", __app_name__, __version__,
+                                           sys.argv[1:] if argv is None else argv)
 
     if args.command == "list":
         return cmd_list(args)
@@ -238,6 +255,7 @@ def main(argv: list[str] | None = None) -> int:
         capture=args.capture,
         encoder=args.encoder,
         audio=args.audio,
+        probe_hdcp=args.probe_hdcp,
     )
 
     def _stop(*_a):

@@ -182,6 +182,7 @@ def run_ui(args) -> int:
                             width=args.width, height=args.height, fps=args.fps, mode=mode,
                             rtsp_port=args.port, bitrate_kbps=args.bitrate, advertise_ip=advertise,
                             usb_link=usb_link, capture=args.capture, encoder=args.encoder, audio=args.audio,
+                            probe_hdcp=bool(getattr(args, "probe_hdcp", False)),
                         )
                         s.start()
                         notes = "\n".join(s.notes)
