@@ -9,7 +9,7 @@ No Pop!_OS / Ubuntu:
 
   sudo apt update
   sudo apt install -y python3-gi python3-gi-cairo gir1.2-gtk-4.0 gir1.2-adw-1 \\
-    gstreamer1.0-tools gstreamer1.0-plugins-base gstreamer1.0-plugins-good \\
+    gstreamer1.0-tools gstreamer1.0-plugins-base gstreamer1.0-plugins-good gstreamer1.0-plugins-bad \\
     gstreamer1.0-plugins-ugly gstreamer1.0-libav gstreamer1.0-pipewire
 
   cd ~/segunda-tela-linux   # ou o caminho do clone

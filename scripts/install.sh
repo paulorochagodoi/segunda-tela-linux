@@ -54,10 +54,12 @@ Exec=$HOME/.local/bin/segunda-tela --ui
 Terminal=false
 Type=Application
 Categories=Utility;Network;
-Keywords=miracast;second;screen;tablet;
+Keywords=miracast;second;screen;tablet;wifi;direct;extend;
 DESK
 
-echo "Instalado. Rode: segunda-tela   ou   segunda-tela --ui"
+echo "Instalado. Rode: segunda-tela --ui   ou   segunda-tela list"
+echo "Estender (monitor virtual): sudo $ROOT/scripts/setup-evdi.sh  (uma vez; ver docs/COSMIC.md)"
+echo "Diagnóstico: segunda-tela doctor"
 echo "Opcional USB: sudo $ROOT/scripts/install-udev-samsung.sh"
 # sanity
 "$ROOT/.venv/bin/segunda-tela" --version || true

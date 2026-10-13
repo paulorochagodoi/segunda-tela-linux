@@ -6,7 +6,6 @@ import sys
 import time
 
 from . import __app_name__, __version__
-from .session import SecondScreenSession
 from .util.logging import setup_logging
 
 
@@ -20,11 +19,29 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     p.add_argument("-v", "--verbose", action="store_true")
-    p.add_argument("--width", type=int, default=1920)
-    p.add_argument("--height", type=int, default=1080)
-    p.add_argument("--fps", type=int, default=30)
-    p.add_argument("--bitrate", type=int, default=8000, help="H.264 bitrate kbps")
+    p.add_argument("--width", type=int, default=None, help="Stream/monitor width (default: negotiate, monitor 1920)")
+    p.add_argument("--height", type=int, default=None, help="Stream/monitor height (default: negotiate, monitor 1200)")
+    p.add_argument("--fps", type=int, default=None, help="Max fps (default 60 with VAAPI, 30 with x264)")
+    p.add_argument("--bitrate", type=int, default=None, help="H.264 bitrate kbps (default: by resolution)")
     p.add_argument("--mode", choices=["extend", "mirror", "region"], default="extend")
+    p.add_argument(
+        "--device",
+        metavar="NOME|MAC|PATH",
+        help="Wi-Fi P2P sink to connect to (see `segunda-tela list`). Without it: listen on the LAN.",
+    )
+    p.add_argument("--discover-timeout", type=float, default=20.0, help="P2P discovery seconds (default 20)")
+    p.add_argument(
+        "--capture",
+        choices=["auto", "portal", "evdi", "x11", "test"],
+        default="auto",
+        help="Frame source: portal (ScreenCast), evdi (grab virtual output directly), x11, test pattern",
+    )
+    p.add_argument(
+        "--encoder",
+        default="auto",
+        help="H.264 encoder: auto|vah264enc|vaapih264enc|x264enc|openh264enc",
+    )
+    p.add_argument("--audio", action="store_true", help="Also send desktop audio (AAC) if the sink supports it")
     p.add_argument("--port", type=int, default=7236, help="WFD RTSP port (default 7236)")
     p.add_argument("--bind", default="0.0.0.0")
     p.add_argument("--ui", action="store_true", help="Launch GTK UI")
@@ -33,21 +50,12 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="USB cable mode: detect Samsung (VID 04e8), use tether/adb, then WFD over that link",
     )
-    p.add_argument(
-        "--prefer-adb",
-        action="store_true",
-        help="With --usb, try adb reverse before USB tethering",
-    )
-    p.add_argument(
-        "--usb-wait",
-        type=float,
-        default=20.0,
-        help="Seconds to wait for USB tether interface (default 20)",
-    )
+    p.add_argument("--prefer-adb", action="store_true", help="With --usb, try adb reverse before USB tethering")
+    p.add_argument("--usb-wait", type=float, default=20.0, help="Seconds to wait for USB tether interface (default 20)")
     p.add_argument(
         "--loopback-test",
         action="store_true",
-        help="Run RTSP handshake against self and exit (CI / no tablet)",
+        help="Run WFD (M1–M7) + plain RTSP handshakes against self and exit (CI / no tablet)",
     )
     p.add_argument(
         "--usb-detect-test",
@@ -59,21 +67,101 @@ def build_parser() -> argparse.ArgumentParser:
     usb_p = sub.add_parser("usb", help="Same as --usb (subcommand form)")
     usb_p.add_argument("--prefer-adb", action="store_true")
     usb_p.add_argument("--usb-wait", type=float, default=20.0)
+    list_p = sub.add_parser("list", help="Discover Wi-Fi P2P peers (Miracast sinks)")
+    list_p.add_argument("--timeout", type=float, default=15.0, help="Discovery seconds (default 15)")
+    list_p.add_argument("--all", action="store_true", help="Also show peers without WFD IEs")
+    sub.add_parser("doctor", help="Check EVDI, GStreamer encoders, NetworkManager P2P and portal")
     return p
+
+
+def cmd_list(args) -> int:
+    from .wfd.p2p import NMWifiP2P, P2PError, format_peer_table
+
+    try:
+        nm = NMWifiP2P()
+        last = {"n": -1}
+
+        def progress(peers):
+            if len(peers) != last["n"]:
+                last["n"] = len(peers)
+                print(f"… {len(peers)} peer(s)", file=sys.stderr, flush=True)
+
+        peers = nm.discover(args.timeout, on_update=progress)
+    except P2PError as exc:
+        print(f"P2P: {exc}", file=sys.stderr)
+        return 2
+    if not args.all:
+        peers = [p for p in peers if p.wfd_capable]
+    if not peers:
+        print("Nenhum sink Miracast encontrado. No tablet, deixe a tela de recepção (Smart View / "
+              "‘Segunda tela’ / Wireless display) aberta e rode de novo. Use --all para ver todos os peers.")
+        return 1
+    print(format_peer_table(peers))
+    return 0
+
+
+def cmd_doctor(_args) -> int:
+    import os
+    import shutil
+
+    from .display import evdi as ev
+    from .wfd.pipeline import ENCODER_ORDER, gst_element_available, pick_encoder
+
+    ok = True
+
+    def line(good: bool, label: str, detail: str = "") -> None:
+        nonlocal ok
+        ok &= good
+        print(f"[{'ok' if good else '!!'}] {label}{(' — ' + detail) if detail else ''}")
+
+    line(bool(shutil.which("gst-launch-1.0")), "gst-launch-1.0")
+    for el in ("mpegtsmux", "rtpmp2tpay", "pipewiresrc", "rawvideoparse"):
+        line(gst_element_available(el), f"GStreamer element {el}")
+    encs = [e for e in ENCODER_ORDER if gst_element_available(e)]
+    line(bool(encs), "H.264 encoders", ", ".join(encs) or "none (install gstreamer1.0-plugins-bad / -vaapi / -ugly)")
+    print(f"     → would use: {pick_encoder()}")
+    line(ev.module_loaded(), "evdi kernel module", "" if ev.module_loaded() else "sudo modprobe evdi")
+    try:
+        ev.load_libevdi()
+        line(True, "libevdi")
+    except ev.EvdiError:
+        line(False, "libevdi", "sudo apt install libevdi1")
+    line(bool(ev.evdi_cards()), "evdi DRM device", ev.device_node_hint())
+    session = os.environ.get("XDG_SESSION_TYPE", "?")
+    desktop = os.environ.get("XDG_CURRENT_DESKTOP", "?")
+    print(f"[..] session={session} desktop={desktop}")
+    try:
+        from .wfd.p2p import NMWifiP2P
+
+        dev, iface = NMWifiP2P().p2p_device()
+        line(True, "NetworkManager Wi-Fi P2P device", f"{iface} ({dev})")
+    except Exception as exc:  # noqa: BLE001
+        line(False, "NetworkManager Wi-Fi P2P device", str(exc))
+    try:
+        from .display.portal import _GioSession
+
+        s = _GioSession(timeout_s=5)
+        try:
+            line(True, "ScreenCast portal", f"version {s.prop('version')}")
+        finally:
+            s.finish_setup()
+    except Exception as exc:  # noqa: BLE001
+        line(False, "ScreenCast portal", str(exc))
+    return 0 if ok else 1
 
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     setup_logging(args.verbose)
 
+    if args.command == "list":
+        return cmd_list(args)
+    if args.command == "doctor":
+        return cmd_doctor(args)
+
     use_usb = bool(getattr(args, "usb", False) or args.command == "usb")
-    if args.command == "usb":
-        # subcommand flags
-        prefer_adb = args.prefer_adb
-        usb_wait = args.usb_wait
-    else:
-        prefer_adb = args.prefer_adb
-        usb_wait = args.usb_wait
+    prefer_adb = args.prefer_adb
+    usb_wait = args.usb_wait
 
     if args.ui:
         from .ui.app import run_ui
@@ -96,17 +184,17 @@ def main(argv: list[str] | None = None) -> int:
             print(f"{d.vid}:{d.pid} serial={d.serial or '-'} {d.product} ({d.sysfs})")
         return 0
 
+    if use_usb and args.device:
+        print("Use --usb ou --device, não ambos.", file=sys.stderr)
+        return 2
+
     usb_link = None
     advertise = None
     if use_usb:
         from .usb.link import UsbLinkError, prepare_usb_link
 
         try:
-            usb_link = prepare_usb_link(
-                rtsp_port=args.port,
-                prefer_adb=prefer_adb,
-                wait_tether_s=usb_wait,
-            )
+            usb_link = prepare_usb_link(rtsp_port=args.port, prefer_adb=prefer_adb, wait_tether_s=usb_wait)
         except UsbLinkError as exc:
             print(f"USB: {exc}", file=sys.stderr)
             return 2
@@ -114,6 +202,8 @@ def main(argv: list[str] | None = None) -> int:
             print(f"USB: {n}", flush=True)
         if usb_link.transport != "adb-reverse":
             advertise = usb_link.local_ip
+
+    from .session import SecondScreenSession
 
     session = SecondScreenSession(
         width=args.width,
@@ -125,8 +215,10 @@ def main(argv: list[str] | None = None) -> int:
         bitrate_kbps=args.bitrate,
         advertise_ip=advertise,
         usb_link=usb_link,
+        capture=args.capture,
+        encoder=args.encoder,
+        audio=args.audio,
     )
-    session.start()
 
     def _stop(*_a):
         session.stop()
@@ -134,9 +226,34 @@ def main(argv: list[str] | None = None) -> int:
 
     signal.signal(signal.SIGINT, _stop)
     signal.signal(signal.SIGTERM, _stop)
+
+    try:
+        session.start()
+    except Exception as exc:  # noqa: BLE001
+        print(f"Erro ao iniciar: {exc}", file=sys.stderr)
+        session.stop()
+        return 2
+    for note in session.notes:
+        print(note, flush=True)
+
     how = "USB+WFD" if use_usb else "WFD"
+    if args.device:
+        from .wfd.p2p import P2PError, find_and_connect
+
+        print(f"Procurando '{args.device}' via Wi-Fi Direct ({args.discover_timeout:.0f}s)…", flush=True)
+        try:
+            link = find_and_connect(args.device, discover_s=args.discover_timeout, rtsp_port=args.port)
+        except P2PError as exc:
+            print(f"P2P: {exc}", file=sys.stderr)
+            session.stop()
+            return 2
+        session.attach_p2p(link)
+        how = f"P2P+WFD {link.interface}"
+        print(f"Wi-Fi Direct conectado a {link.peer.label} ({link.interface}, {link.local_ip}). "
+              f"Aguardando o tablet abrir RTSP…", flush=True)
+
     print(
-        f"{__app_name__} v{__version__} ({how}) listening. "
+        f"{__app_name__} v{__version__} ({how}, {args.mode}) pronto. "
         f"Sink → rtsp://{session.advertise_ip}:{args.port}",
         flush=True,
     )

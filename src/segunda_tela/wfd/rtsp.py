@@ -1,9 +1,25 @@
-"""Minimal Wi-Fi Display (Miracast) RTSP source server.
+"""Wi-Fi Display (Miracast) RTSP *source* (WFD spec v1.0, section 6.4).
 
-Implements enough of the WFD source role for a sink to negotiate H.264 over RTP.
-Based on public Wi-Fi Display specs / open implementations (behavior only).
-Not affiliated with Samsung. Not a reimplementation of Samsung's proprietary
-RTSP body types (Version/Mcc/HardwareCursor/…).
+Message flow once a sink opens TCP to our port 7236:
+
+    M1  source → sink   OPTIONS * (Require: org.wfa.wfd1.0)
+    M2  sink → source   OPTIONS *
+    M3  source → sink   GET_PARAMETER  (sink capabilities)
+    M4  source → sink   SET_PARAMETER  (chosen format, presentation URL, RTP ports)
+    M5  source → sink   SET_PARAMETER  wfd_trigger_method: SETUP
+    M6  sink → source   SETUP
+    M7  sink → source   PLAY           → we start MPEG-TS/RTP to the sink
+    M16 source → sink   GET_PARAMETER  (keep-alive, every ~25 s)
+
+The source being the side that speaks first is essential: a server that only
+waits for requests (as earlier versions of this project did) never gets past
+the TCP connect with a real sink.
+
+If the peer speaks first (OPTIONS before our M1, e.g. VLC or the legacy
+loopback test) we fall back to plain reactive RTSP handling.
+
+Written from the public spec; behaviour cross-checked against the open-source
+gnome-network-displays project. Not affiliated with Samsung.
 """
 from __future__ import annotations
 
@@ -12,341 +28,451 @@ import random
 import socket
 import socketserver
 import threading
+import time
 from dataclasses import dataclass, field
 from typing import Callable, Optional
+
+from .formats import (  # re-exported for backwards compatibility
+    CEA_MODES,
+    DEFAULT_RTP_PORT,
+    FALLBACK_MODE,
+    H264_LEVEL_31,
+    H264_LEVEL_32,
+    H264_LEVEL_40,
+    H264_LEVEL_41,
+    H264_LEVEL_42,
+    H264_PROFILE_CBP,
+    H264_PROFILE_CHP,
+    LEVEL_IDC,
+    M3_QUERY_KEYS,
+    Negotiated,
+    SinkCaps,
+    VideoMode,
+    cea_bitmap,
+    cea_native_index,
+    h264_level_for,
+    m4_video_descriptor,
+    negotiate,
+    parse_client_rtp_ports,
+    parse_parameters,
+    parse_sink_caps,
+    requested_keys,
+    wfd_audio_codecs,
+    wfd_video_formats,
+)
+
+__all__ = [
+    "CEA_MODES", "H264_LEVEL_31", "H264_LEVEL_32", "H264_LEVEL_40", "H264_LEVEL_41", "H264_LEVEL_42",
+    "H264_PROFILE_CBP", "H264_PROFILE_CHP", "cea_bitmap", "cea_native_index", "h264_level_for",
+    "requested_keys", "wfd_audio_codecs", "wfd_video_formats", "SessionState", "WfdRtspServer",
+    "RtspMessage", "local_ip",
+]
 
 log = logging.getLogger(__name__)
 
 WFD_DEFAULT_PORT = 7236
-
-# CEA resolution/refresh table from the public Wi-Fi Display Technical
-# Specification v1.0 (Table 5-10). Index == bit position in the 32-bit
-# CEA support bitmap of wfd_video_formats.
-CEA_MODES: tuple[tuple[int, int, int, bool], ...] = (
-    (640, 480, 60, False),     # 0
-    (720, 480, 60, False),     # 1
-    (720, 480, 60, True),      # 2 (interlaced)
-    (720, 576, 50, False),     # 3
-    (720, 576, 50, True),      # 4 (interlaced)
-    (1280, 720, 30, False),    # 5
-    (1280, 720, 60, False),    # 6
-    (1920, 1080, 30, False),   # 7
-    (1920, 1080, 60, False),   # 8
-    (1920, 1080, 60, True),    # 9 (interlaced)
-    (1280, 720, 25, False),    # 10
-    (1280, 720, 50, False),    # 11
-    (1920, 1080, 25, False),   # 12
-    (1920, 1080, 50, False),   # 13
-    (1920, 1080, 50, True),    # 14 (interlaced)
-    (1280, 720, 24, False),    # 15
-    (1920, 1080, 24, False),   # 16
-)
-
-# H.264 profile / level bitmaps (WFD spec v1.0, Tables 5-11 / 5-12).
-H264_PROFILE_CBP = 0x01  # Constrained Baseline
-H264_PROFILE_CHP = 0x02  # Constrained High
-H264_LEVEL_31 = 0x01
-H264_LEVEL_32 = 0x02
-H264_LEVEL_40 = 0x04
-H264_LEVEL_41 = 0x08
-H264_LEVEL_42 = 0x10
-
-# Audio mode bitmaps (WFD spec v1.0, Tables 5-21 / 5-22).
-LPCM_44K_2CH = 0x1
-LPCM_48K_2CH = 0x2
-AAC_48K_2CH = 0x1
-
-# Keys this source can answer in a GET_PARAMETER response.
-_WFD_KEYS = (
-    "wfd_video_formats",
-    "wfd_audio_codecs",
-    "wfd_client_rtp_ports",
-    "wfd_content_protection",
-    "wfd_uibc_capability",
-    "wfd_display_edid",
-    "wfd_connector_type",
-)
+KEEPALIVE_S = 25
+SESSION_TIMEOUT_S = 30
+PUBLIC_METHODS = "org.wfa.wfd1.0, SET_PARAMETER, GET_PARAMETER"
+PLAIN_PUBLIC = "org.wfa.wfd1.0, GET_PARAMETER, SET_PARAMETER, OPTIONS, DESCRIBE, SETUP, PLAY, PAUSE, TEARDOWN"
 
 
-def cea_bitmap(width: int, height: int, fps: int) -> int:
-    """Progressive CEA modes that fit within width x height at <= fps."""
-    mask = 0
-    for bit, (w, h, r, interlaced) in enumerate(CEA_MODES):
-        if not interlaced and w <= width and h <= height and r <= fps:
-            mask |= 1 << bit
-    # 640x480p60 is mandatory for every WFD device.
-    return mask | 1
+# ------------------------------------------------------------------ messages
+
+@dataclass
+class RtspMessage:
+    first_line: str
+    headers: dict[str, str] = field(default_factory=dict)  # lower-case keys
+    body: str = ""
+
+    @property
+    def is_response(self) -> bool:
+        return self.first_line.startswith("RTSP/")
+
+    @property
+    def method(self) -> str:
+        return "" if self.is_response else self.first_line.split(" ", 1)[0].upper()
+
+    @property
+    def status(self) -> int:
+        if not self.is_response:
+            return 0
+        try:
+            return int(self.first_line.split()[1])
+        except (IndexError, ValueError):
+            return 0
+
+    @property
+    def cseq(self) -> str:
+        return self.headers.get("cseq", "0")
 
 
-def cea_native_index(width: int, height: int, fps: int) -> int:
-    """Best progressive CEA index at or below the requested mode (0 = VGA)."""
-    best, best_key = 0, (0, 0)
-    for bit, (w, h, r, interlaced) in enumerate(CEA_MODES):
-        if interlaced or w > width or h > height or r > fps:
-            continue
-        key = (w * h, r)
-        if key > best_key:
-            best, best_key = bit, key
-    return best
+def encode_message(first_line: str, headers: dict[str, str], body: str = "") -> bytes:
+    headers = dict(headers)
+    raw_body = body.encode()
+    if raw_body:
+        headers.setdefault("Content-Type", "text/parameters")
+        headers["Content-Length"] = str(len(raw_body))
+    lines = [first_line] + [f"{k}: {v}" for k, v in headers.items()]
+    return ("\r\n".join(lines) + "\r\n\r\n").encode() + raw_body
 
 
-def h264_level_for(width: int, height: int, fps: int) -> int:
-    """Smallest WFD H.264 level whose macroblock rate covers the mode."""
-    mbps = ((width + 15) // 16) * ((height + 15) // 16) * fps
-    # MaxMBPS per ITU-T H.264 Table A-1.
-    for level, max_mbps in (
-        (H264_LEVEL_31, 108000),
-        (H264_LEVEL_32, 216000),
-        (H264_LEVEL_40, 245760),
-        (H264_LEVEL_41, 245760),
-        (H264_LEVEL_42, 522240),
-    ):
-        if mbps <= max_mbps:
-            return level
-    return H264_LEVEL_42
+class MessageReader:
+    """Incremental RTSP message parser over a socket."""
+
+    def __init__(self, sock: socket.socket) -> None:
+        self.sock = sock
+        self.buf = b""
+
+    def feed(self, data: bytes) -> None:
+        self.buf += data
+
+    def pop(self) -> Optional[RtspMessage]:
+        if b"\r\n\r\n" not in self.buf:
+            return None
+        head, rest = self.buf.split(b"\r\n\r\n", 1)
+        lines = head.decode("utf-8", "replace").split("\r\n")
+        headers: dict[str, str] = {}
+        for line in lines[1:]:
+            if ":" in line:
+                k, v = line.split(":", 1)
+                headers[k.strip().lower()] = v.strip()
+        try:
+            clen = int(headers.get("content-length", "0") or 0)
+        except ValueError:
+            clen = 0
+        if len(rest) < clen:
+            return None
+        body, self.buf = rest[:clen], rest[clen:]
+        return RtspMessage(lines[0].strip(), headers, body.decode("utf-8", "replace"))
 
 
-# WFD level bit -> H.264 level_idc (for SDP profile-level-id).
-_LEVEL_IDC = {H264_LEVEL_31: 31, H264_LEVEL_32: 32, H264_LEVEL_40: 40, H264_LEVEL_41: 41, H264_LEVEL_42: 42}
-
-
-def wfd_video_formats(width: int, height: int, fps: int, profile: int = H264_PROFILE_CBP) -> str:
-    """Build a WFD v1.0 wfd_video_formats value for a single H.264 codec entry.
-
-    Layout: native preferred-display-mode profile level CEA VESA HH latency
-    min-slice-size slice-enc-params frame-rate-control max-hres max-vres.
-    """
-    native = (cea_native_index(width, height, fps) << 3) | 0x0  # table 0 = CEA
-    return (
-        f"{native:02x} 00 {profile:02x} {h264_level_for(width, height, fps):02x} "
-        f"{cea_bitmap(width, height, fps):08x} 00000000 00000000 "
-        "00 0000 0000 00 none none"
-    )
-
-
-def wfd_audio_codecs() -> str:
-    return f"LPCM {LPCM_44K_2CH | LPCM_48K_2CH:08x} 00, AAC {AAC_48K_2CH:08x} 00"
-
-
-def requested_keys(body: str) -> list[str]:
-    """Parameter names listed in a GET_PARAMETER body (one per line)."""
-    return [line.strip() for line in body.splitlines() if line.strip()]
-
+# ------------------------------------------------------------------ session
 
 @dataclass
 class SessionState:
-    session_id: str = field(default_factory=lambda: str(random.randint(1, 99999999)))
-    url: str = "rtsp://127.0.0.1/wfd1.0"
-    rtp_port: int = 19000
+    session_id: str = field(default_factory=lambda: f"{random.randint(1, 0x7FFFFFFF):08X}")
+    url: str = "rtsp://127.0.0.1/wfd1.0/streamid=0"
+    rtp_port: int = DEFAULT_RTP_PORT
+    rtcp_port: int = 0
     width: int = 1920
     height: int = 1080
     fps: int = 30
     playing: bool = False
     cseq: int = 0
     remote: str = ""
+    local: str = ""
+    wfd: bool = True
+    sink: Optional[SinkCaps] = None
+    negotiated: Optional[Negotiated] = None
+    m4_attempts: int = 0
+
+    @property
+    def mode(self) -> VideoMode:
+        if self.negotiated:
+            return self.negotiated.mode
+        return VideoMode(self.width, self.height, self.fps)
 
 
-class _Handler(socketserver.StreamRequestHandler):
-    server: "WfdRtspServer"  # type: ignore[name-defined]
+class _Handler(socketserver.BaseRequestHandler):
+    server: "WfdRtspServer"
 
+    # --- plumbing
+    def setup(self) -> None:
+        self.sock: socket.socket = self.request
+        self.reader = MessageReader(self.sock)
+        self._cseq = 0
+        self._pending: dict[str, str] = {}  # our CSeq -> purpose
+        self._send_lock = threading.Lock()
+        self._m1_ok = False
+        self._m2_seen = False
+        self._m3_sent = False
+        self._m1_at = 0.0
+        self._last_keepalive = time.monotonic()
+        self._closing = False
+
+    def _send(self, data: bytes) -> None:
+        with self._send_lock:
+            self.sock.sendall(data)
+
+    def _request(self, method: str, url: str, purpose: str, body: str = "", extra: Optional[dict] = None) -> None:
+        self._cseq += 1
+        headers = {"CSeq": str(self._cseq)}
+        if extra:
+            headers.update(extra)
+        self._pending[str(self._cseq)] = purpose
+        log.info("→ %s %s (CSeq %s, %s)", method, url, self._cseq, purpose)
+        if body:
+            log.debug("   body: %r", body)
+        self._send(encode_message(f"{method} {url} RTSP/1.0", headers, body))
+
+    def _reply(self, msg: RtspMessage, code: int = 200, reason: str = "OK", extra: Optional[dict] = None, body: str = "") -> None:
+        headers = {"CSeq": msg.cseq}
+        if extra:
+            headers.update(extra)
+        self._send(encode_message(f"RTSP/1.0 {code} {reason}", headers, body))
+        log.debug("→ %s %s (CSeq %s)", code, reason, msg.cseq)
+
+    # --- main loop
     def handle(self) -> None:
         peer = self.client_address[0]
-        log.info("RTSP client connected from %s", peer)
+        srv = self.server
         state = SessionState(
-            width=self.server.width,
-            height=self.server.height,
-            fps=self.server.fps,
+            width=srv.width,
+            height=srv.height,
+            fps=srv.fps,
             remote=peer,
-            url=f"rtsp://{self.server.advertise_host}/wfd1.0",
+            local=self.sock.getsockname()[0],
         )
-        buf = b""
+        state.url = f"rtsp://{state.local}/wfd1.0/streamid=0"
+        self.state = state
+        srv._register(self)
+        log.info("RTSP sink connected from %s (local %s)", peer, state.local)
         try:
-            while True:
-                chunk = self.request.recv(4096)
-                if not chunk:
-                    break
-                buf += chunk
-                while b"\r\n\r\n" in buf:
-                    header, buf = buf.split(b"\r\n\r\n", 1)
-                    text = header.decode("utf-8", "replace")
-                    lines = text.split("\r\n")
-                    req_line = lines[0]
-                    headers = {}
-                    for line in lines[1:]:
-                        if ":" in line:
-                            k, v = line.split(":", 1)
-                            headers[k.strip().lower()] = v.strip()
-                    content_len = int(headers.get("content-length", "0") or 0)
-                    body = b""
-                    if content_len:
-                        while len(buf) < content_len:
-                            more = self.request.recv(4096)
-                            if not more:
-                                break
-                            buf += more
-                        body, buf = buf[:content_len], buf[content_len:]
-                    self._dispatch(state, req_line, headers, body.decode("utf-8", "replace"))
+            self._serve(state)
         finally:
-            if state.playing and self.server.on_teardown:
-                self.server.on_teardown(state)
-            log.info("RTSP client %s disconnected", peer)
+            if state.playing and srv.on_teardown:
+                state.playing = False
+                srv.on_teardown(state)
+            srv._unregister(self)
+            log.info("RTSP sink %s disconnected", peer)
 
-    def _reply(self, state: SessionState, code: int, reason: str, extra: Optional[dict] = None, body: str = "") -> None:
-        state.cseq += 0  # keep last
-        cseq = self._last_cseq
-        lines = [f"RTSP/1.0 {code} {reason}", f"CSeq: {cseq}"]
-        if extra:
-            for k, v in extra.items():
-                lines.append(f"{k}: {v}")
-        if body:
-            lines.append(f"Content-Length: {len(body.encode())}")
-            lines.append("Content-Type: text/parameters")
-        lines.append("")
-        lines.append(body)
-        data = "\r\n".join(lines).encode()
-        if not body:
-            # ensure ending CRLFCRLFstyle when no body — already have trailing empty
-            if not data.endswith(b"\r\n\r\n"):
-                data = data.rstrip(b"\r\n") + b"\r\n\r\n"
-        self.request.sendall(data)
-        log.debug("→ %s %s", code, reason)
+    def _serve(self, state: SessionState) -> None:
+        srv = self.server
+        # Give a plain RTSP client a moment to speak first.
+        self.sock.settimeout(srv.m1_delay_s)
+        first: bytes = b""
+        try:
+            first = self.sock.recv(4096)
+            if not first:
+                return
+        except socket.timeout:
+            pass
+        except OSError:
+            return
 
-    def _dispatch(self, state: SessionState, req_line: str, headers: dict, body: str) -> None:
-        parts = req_line.split()
-        method = parts[0].upper() if parts else ""
-        self._last_cseq = headers.get("cseq", "0")
-        log.info("← %s (CSeq %s)", method, self._last_cseq)
+        if first:
+            state.wfd = False
+            log.info("peer spoke first → plain RTSP mode")
+            self.reader.feed(first)
+        else:
+            self._m1_at = time.monotonic()
+            self._request("OPTIONS", "*", "M1", extra={"Require": "org.wfa.wfd1.0"})
+
+        self.sock.settimeout(1.0)
+        try:
+            while not self._closing:
+                msg = self.reader.pop()
+                if msg is not None:
+                    self._dispatch(msg)
+                    continue
+                try:
+                    data = self.sock.recv(65536)
+                except socket.timeout:
+                    self._tick()
+                    continue
+                if not data:
+                    break
+                self.reader.feed(data)
+        except OSError as exc:
+            log.info("RTSP connection error: %s", exc)
+
+    def _tick(self) -> None:
+        now = time.monotonic()
+        # Some sinks never send M2; don't stall the negotiation forever.
+        if self.state.wfd and self._m1_ok and not self._m3_sent and now - self._m1_at > 3:
+            log.info("no M2 from sink; sending M3 anyway")
+            self._send_m3()
+        if self.state.wfd and self.state.playing and now - self._last_keepalive >= self.server.keepalive_s:
+            self._last_keepalive = now
+            self._request("GET_PARAMETER", "rtsp://localhost/wfd1.0", "M16",
+                          extra={"Session": self.state.session_id})
+
+    # --- WFD source steps
+    def _send_m3(self) -> None:
+        if self._m3_sent:
+            return
+        self._m3_sent = True
+        body = "\r\n".join(M3_QUERY_KEYS) + "\r\n"
+        self._request("GET_PARAMETER", "rtsp://localhost/wfd1.0", "M3", body=body,
+                      extra={"Content-Type": "text/parameters"})
+
+    def _send_m4(self) -> None:
+        st = self.state
+        assert st.negotiated is not None
+        st.m4_attempts += 1
+        n = st.negotiated
+        lines = [f"wfd_video_formats: {m4_video_descriptor(n.mode, n.level, n.profile)}"]
+        if n.audio:
+            lines.append(f"wfd_audio_codecs: {n.audio}")
+        lines.append(f"wfd_presentation_URL: {st.url} none")
+        lines.append(f"wfd_client_rtp_ports: RTP/AVP/UDP;unicast {st.rtp_port} {st.rtcp_port} mode=play")
+        self._request("SET_PARAMETER", "rtsp://localhost/wfd1.0", "M4", body="\r\n".join(lines) + "\r\n",
+                      extra={"Content-Type": "text/parameters"})
+
+    def _send_m5(self, method: str = "SETUP") -> None:
+        self._request("SET_PARAMETER", "rtsp://localhost/wfd1.0", f"M5-{method}",
+                      body=f"wfd_trigger_method: {method}\r\n", extra={"Content-Type": "text/parameters"})
+
+    def _on_response(self, msg: RtspMessage) -> None:
+        purpose = self._pending.pop(msg.cseq, "?")
+        log.info("← %s for %s (CSeq %s)", msg.status, purpose, msg.cseq)
+        st = self.state
+        srv = self.server
+        if purpose == "M1":
+            if msg.status != 200 or "org.wfa.wfd1.0" not in msg.headers.get("public", "org.wfa.wfd1.0"):
+                log.warning("sink M1 reply unexpected: %s %s", msg.first_line, msg.headers.get("public"))
+            self._m1_ok = True
+            if self._m2_seen:
+                self._send_m3()
+        elif purpose == "M3":
+            if msg.status != 200:
+                log.warning("M3 rejected (%s); using fallback caps", msg.status)
+            st.sink = parse_sink_caps(msg.body)
+            log.info("sink caps: %s", {k: v for k, v in st.sink.raw.items() if k != "wfd_display_edid"})
+            st.rtp_port, st.rtcp_port = st.sink.rtp_port, st.sink.rtcp_port
+            st.negotiated = srv.negotiate(st.sink)
+            log.info("negotiated %s level=0x%02x audio=%s (%s); RTP→%s:%s RTCP=%s",
+                     st.negotiated.mode, st.negotiated.level, st.negotiated.audio or "none",
+                     st.negotiated.reason, st.remote, st.rtp_port, st.rtcp_port or "off")
+            if srv.on_negotiated:
+                srv.on_negotiated(st)
+            self._send_m4()
+        elif purpose == "M4":
+            if msg.status == 200:
+                self._send_m5("SETUP")
+            elif st.m4_attempts < 2 and st.negotiated and st.negotiated.mode != FALLBACK_MODE:
+                log.warning("sink rejected %s; retrying M4 with 1080p30", st.negotiated.mode)
+                st.negotiated = Negotiated(FALLBACK_MODE, h264_level_for(1920, 1080, 30),
+                                           audio=st.negotiated.audio, reason="M4 fallback")
+                if srv.on_negotiated:
+                    srv.on_negotiated(st)
+                self._send_m4()
+            else:
+                log.error("sink rejected M4 (%s); giving up", msg.status)
+
+    def _dispatch(self, msg: RtspMessage) -> None:
+        if msg.is_response:
+            self._on_response(msg)
+            return
+        st = self.state
+        method = msg.method
+        log.info("← %s (CSeq %s)", method, msg.cseq)
 
         if method == "OPTIONS":
-            self._reply(
-                state,
-                200,
-                "OK",
-                {"Public": "org.wfa.wfd1.0, GET_PARAMETER, SET_PARAMETER, OPTIONS, DESCRIBE, SETUP, PLAY, PAUSE, TEARDOWN"},
-            )
-            # WFD often triggers source→sink GET_PARAMETER via SET; we answer sink requests only here.
+            self._m2_seen = True
+            self._reply(msg, extra={"Public": PUBLIC_METHODS if st.wfd else PLAIN_PUBLIC})
+            if st.wfd and self._m1_ok:
+                self._send_m3()
             return
 
         if method == "GET_PARAMETER":
-            keys = requested_keys(body)
+            keys = requested_keys(msg.body)
             if not keys:
-                # Empty GET_PARAMETER is a WFD keep-alive.
-                self._reply(state, 200, "OK")
-                return
-            self._reply(state, 200, "OK", body=self._wfd_params(state, keys))
+                self._reply(msg)  # keep-alive
+            else:
+                self._reply(msg, body=self._source_params(keys))
             return
 
         if method == "SET_PARAMETER":
-            if "wfd_trigger_method: SETUP" in body:
-                self._reply(state, 200, "OK")
-                # Optionally send SETUP trigger response path — many sinks send SETUP themselves
-                return
-            if "wfd_trigger_method: PLAY" in body:
-                self._reply(state, 200, "OK")
-                return
-            # honor client RTP ports if present
-            for line in body.splitlines():
-                if line.startswith("wfd_client_rtp_ports:"):
-                    # format: RTP/AVP/UDP;unicast <rtp> <rtcp> mode=play
-                    bits = line.split()
-                    for b in bits:
-                        if b.isdigit():
-                            state.rtp_port = int(b)
-                            break
-            self._reply(state, 200, "OK")
+            params = parse_parameters(msg.body)
+            if "wfd_idr_request" in params:
+                log.info("sink requested IDR (GOP is 1 s, next keyframe soon)")
+                if self.server.on_idr_request:
+                    self.server.on_idr_request(st)
+            if "wfd_client_rtp_ports" in params:
+                st.rtp_port, st.rtcp_port = parse_client_rtp_ports(params["wfd_client_rtp_ports"])
+            self._reply(msg)
             return
 
         if method == "SETUP":
-            transport = headers.get("transport", "RTP/AVP/UDP;unicast;client_port=19000-19001")
-            # parse client_port
+            transport = msg.headers.get("transport", "")
             if "client_port=" in transport:
                 try:
-                    cp = transport.split("client_port=")[1].split(";")[0]
-                    state.rtp_port = int(cp.split("-")[0])
+                    ports = transport.split("client_port=")[1].split(";")[0].split("-")
+                    st.rtp_port = int(ports[0])
+                    if len(ports) > 1 and int(ports[1]) not in (0, st.rtp_port):
+                        st.rtcp_port = int(ports[1])
                 except ValueError:
                     pass
-            resp_transport = (
-                f"RTP/AVP/UDP;unicast;client_port={state.rtp_port}-{state.rtp_port+1};"
-                f"server_port={self.server.server_rtp_port}-{self.server.server_rtp_port+1}"
-            )
+            sp = self.server.server_rtp_port
+            client = f"{st.rtp_port}" + (f"-{st.rtcp_port}" if st.rtcp_port else "")
             self._reply(
-                state,
-                200,
-                "OK",
-                {
-                    "Transport": resp_transport,
-                    "Session": f"{state.session_id};timeout=30",
+                msg,
+                extra={
+                    "Transport": f"RTP/AVP/UDP;unicast;client_port={client};server_port={sp}-{sp + 1}",
+                    "Session": f"{st.session_id};timeout={SESSION_TIMEOUT_S}",
                 },
             )
             return
 
         if method == "PLAY":
-            self._reply(
-                state,
-                200,
-                "OK",
-                {
-                    "Session": state.session_id,
-                    "Range": "npt=0.000-",
-                },
-            )
-            state.playing = True
-            if self.server.on_play:
-                self.server.on_play(state)
+            self._reply(msg, extra={"Session": st.session_id, "Range": "npt=now-"})
+            was_playing = st.playing
+            st.playing = True
+            self._last_keepalive = time.monotonic()
+            if not was_playing and self.server.on_play:
+                self.server.on_play(st)
             return
 
         if method == "PAUSE":
-            self._reply(state, 200, "OK", {"Session": state.session_id})
+            self._reply(msg, extra={"Session": st.session_id})
+            if st.playing:
+                st.playing = False
+                if self.server.on_teardown:
+                    self.server.on_teardown(st)
             return
 
         if method == "TEARDOWN":
-            self._reply(state, 200, "OK", {"Session": state.session_id})
-            state.playing = False
-            if self.server.on_teardown:
-                self.server.on_teardown(state)
+            self._reply(msg, extra={"Session": st.session_id})
+            if st.playing:
+                st.playing = False
+                if self.server.on_teardown:
+                    self.server.on_teardown(st)
+            self._closing = True
             return
 
         if method == "DESCRIBE":
-            sdp = self._sdp(state)
-            self._reply(
-                state,
-                200,
-                "OK",
-                {"Content-Base": state.url + "/", "Content-Type": "application/sdp"},
-                body=sdp,
-            )
+            self._reply(msg, extra={"Content-Base": st.url + "/", "Content-Type": "application/sdp"},
+                        body=self._sdp(st))
             return
 
-        self._reply(state, 501, "Not Implemented")
+        self._reply(msg, 501, "Not Implemented")
 
-    def _wfd_params(self, state: SessionState, keys: Optional[list[str]] = None) -> str:
+    def _source_params(self, keys: list[str]) -> str:
+        st = self.state
         values = {
-            "wfd_video_formats": wfd_video_formats(state.width, state.height, state.fps),
+            "wfd_video_formats": wfd_video_formats(st.width, st.height, st.fps),
             "wfd_audio_codecs": wfd_audio_codecs(),
-            "wfd_client_rtp_ports": f"RTP/AVP/UDP;unicast {state.rtp_port} 0 mode=play",
+            "wfd_client_rtp_ports": f"RTP/AVP/UDP;unicast {st.rtp_port} {st.rtcp_port} mode=play",
             "wfd_content_protection": "none",
             "wfd_uibc_capability": "none",
             "wfd_display_edid": "none",
-            "wfd_connector_type": "05",  # HDMI
+            "wfd_connector_type": "05",
         }
-        lines = [f"{k}: {values[k]}" for k in (keys or _WFD_KEYS) if k in values]
+        lines = [f"{k}: {values[k]}" for k in keys if k in values]
         return "\r\n".join(lines + [""])
 
-    def _sdp(self, state: SessionState) -> str:
-        level_idc = _LEVEL_IDC[h264_level_for(state.width, state.height, state.fps)]
+    def _sdp(self, st: SessionState) -> str:
         return "\r\n".join(
             [
                 "v=0",
-                f"o=- {state.session_id} 1 IN IP4 {self.server.advertise_host}",
+                f"o=- {st.session_id} 1 IN IP4 {st.local}",
                 "s=SegundaTelaWFD",
-                f"c=IN IP4 {state.remote or self.server.advertise_host}",
+                f"c=IN IP4 {st.remote or st.local}",
                 "t=0 0",
-                "m=video 0 RTP/AVP 96",
-                "a=rtpmap:96 H264/90000",
-                f"a=fmtp:96 profile-level-id=42e0{level_idc:02x}",
+                "m=video 0 RTP/AVP 33",
+                "a=rtpmap:33 MP2T/90000",
                 "",
             ]
         )
+
+    def close(self) -> None:
+        self._closing = True
+        try:
+            self.sock.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
 
 
 class WfdRtspServer(socketserver.ThreadingTCPServer):
@@ -364,6 +490,14 @@ class WfdRtspServer(socketserver.ThreadingTCPServer):
         server_rtp_port: int = 19100,
         on_play: Optional[Callable[[SessionState], None]] = None,
         on_teardown: Optional[Callable[[SessionState], None]] = None,
+        on_negotiated: Optional[Callable[[SessionState], None]] = None,
+        on_idr_request: Optional[Callable[[SessionState], None]] = None,
+        want_size: Optional[tuple[int, int]] = None,
+        max_fps: int = 60,
+        max_pixels: int = 1920 * 1200,
+        audio: bool = False,
+        m1_delay_s: float = 0.5,
+        keepalive_s: float = KEEPALIVE_S,
     ) -> None:
         super().__init__((host, port), _Handler)
         self.advertise_host = advertise_host
@@ -373,7 +507,29 @@ class WfdRtspServer(socketserver.ThreadingTCPServer):
         self.server_rtp_port = server_rtp_port
         self.on_play = on_play
         self.on_teardown = on_teardown
+        self.on_negotiated = on_negotiated
+        self.on_idr_request = on_idr_request
+        self.want_size = want_size
+        self.max_fps = max_fps
+        self.max_pixels = max_pixels
+        self.audio = audio
+        self.m1_delay_s = m1_delay_s
+        self.keepalive_s = keepalive_s
         self._thread: Optional[threading.Thread] = None
+        self._handlers: set[_Handler] = set()
+        self._hlock = threading.Lock()
+
+    def negotiate(self, sink: SinkCaps) -> Negotiated:
+        return negotiate(sink, want=self.want_size, max_fps=self.max_fps,
+                         max_pixels=self.max_pixels, audio=self.audio)
+
+    def _register(self, h: _Handler) -> None:
+        with self._hlock:
+            self._handlers.add(h)
+
+    def _unregister(self, h: _Handler) -> None:
+        with self._hlock:
+            self._handlers.discard(h)
 
     def start_background(self) -> None:
         self._thread = threading.Thread(target=self.serve_forever, name="wfd-rtsp", daemon=True)
@@ -381,6 +537,10 @@ class WfdRtspServer(socketserver.ThreadingTCPServer):
         log.info("WFD RTSP source listening on %s:%s", *self.server_address)
 
     def stop(self) -> None:
+        with self._hlock:
+            handlers = list(self._handlers)
+        for h in handlers:
+            h.close()
         self.shutdown()
         self.server_close()
 

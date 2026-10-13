@@ -1,10 +1,17 @@
-"""Self-test: local RTSP client walks OPTIONS → GET_PARAMETER → SETUP → PLAY → TEARDOWN."""
+"""Self-tests without a tablet.
+
+1. WFD flow: a scripted sink walks M1→M7 against our source and we check
+   the negotiated mode, presentation URL and RTP ports.
+2. Plain RTSP flow: a client that speaks first (OPTIONS → GET_PARAMETER →
+   SETUP → PLAY → TEARDOWN), as earlier versions/tests expected.
+"""
 from __future__ import annotations
 
 import logging
 import socket
 import time
 
+from .fakesink import run_fake_sink
 from .rtsp import WfdRtspServer
 
 log = logging.getLogger(__name__)
@@ -27,7 +34,40 @@ def _txn(sock: socket.socket, req: str) -> str:
     return text + "\r\n\r\n" + rest[:cl].decode("utf-8", "replace")
 
 
-def run_loopback_test(port: int = 17236) -> bool:
+def run_wfd_loopback(port: int = 17236) -> bool:
+    events: dict = {}
+
+    def on_play(st):
+        events["play"] = (st.mode, st.rtp_port, st.rtcp_port)
+
+    def on_teardown(_st):
+        events["teardown"] = True
+
+    srv = WfdRtspServer(host="127.0.0.1", port=port, advertise_host="127.0.0.1",
+                        on_play=on_play, on_teardown=on_teardown, m1_delay_s=0.1)
+    srv.start_background()
+    try:
+        res = run_fake_sink("127.0.0.1", port)
+        vf = res.m4_params.get("wfd_video_formats", "")
+        assert vf.split()[5] == "20000000", vf  # VESA bit 29 = 1920x1200p60
+        assert res.m4_params["wfd_client_rtp_ports"].split()[1] == "19000"
+        assert res.m4_params["wfd_presentation_url"].startswith("rtsp://127.0.0.1/wfd1.0/streamid=0")
+        assert res.setup_reply and res.setup_reply.status == 200
+        assert res.play_reply and res.play_reply.status == 200
+        time.sleep(0.1)
+        mode, rtp, _rtcp = events["play"]
+        assert (mode.width, mode.height, mode.fps, rtp) == (1920, 1200, 60, 19000), events
+        assert events.get("teardown")
+        log.info("loopback WFD (M1–M7) OK: %s", mode)
+        return True
+    except Exception as exc:  # noqa: BLE001
+        log.error("WFD loopback failed: %r", exc)
+        return False
+    finally:
+        srv.stop()
+
+
+def run_plain_loopback(port: int = 17237) -> bool:
     played = {"ok": False}
 
     def on_play(_s):
@@ -66,10 +106,16 @@ def run_loopback_test(port: int = 17236) -> bool:
         )
         assert "200" in r5.split("\r\n")[0], r5
         s.close()
-        log.info("loopback RTSP test OK")
+        log.info("loopback plain RTSP OK")
         return True
     except Exception as exc:  # noqa: BLE001
-        log.error("loopback failed: %s", exc)
+        log.error("plain loopback failed: %r", exc)
         return False
     finally:
         srv.stop()
+
+
+def run_loopback_test(port: int = 17236) -> bool:
+    ok_wfd = run_wfd_loopback(port)
+    ok_plain = run_plain_loopback(port + 1)
+    return ok_wfd and ok_plain
