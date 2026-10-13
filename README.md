@@ -42,7 +42,9 @@ A 0.3 corrige os três.
 - Wi-Fi com P2P no NetworkManager (`nmcli device` mostra `p2p-dev-wlan0/wlo1`)
 - GStreamer 1.0 (base/good/**bad**/ugly/libav/pipewire) + VA-API (`mesa-va-drivers`)
 - `python3-gi` (Gio para NetworkManager e portal; GTK4/libadwaita para a UI)
-- Para **estender**: `evdi-dkms` + `libevdi1` (pacotes da distro)
+- Para **estender**: `evdi-dkms` + `libevdi1` (pacotes da distro; se não
+  compilarem no seu kernel, o `setup-evdi.sh` instala o release do GitHub via
+  DKMS). Secure Boot: cadastre a chave MOK — ver [docs/COSMIC.md](docs/COSMIC.md#secure-boot-mok)
 
 ```bash
 sudo ./scripts/install-deps-popos.sh

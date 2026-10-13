@@ -40,9 +40,36 @@ Notas sobre EVDI:
 - Usamos o **evdi-dkms** e a **libevdi1** da distro (código aberto da
   DisplayLink). O app só chama a libevdi via `ctypes`; não há módulo de kernel
   próprio.
-- Se o `doctor` disser *evdi kernel module* `!!` e você usa **Secure Boot**, o
-  módulo DKMS precisa estar assinado: `sudo mokutil --import /var/lib/dkms/mok.pub`
-  e reinicie (o MOK Manager pede a senha).
+- **Kernel mais novo que o pacote** (ex.: `evdi-dkms` 1.14.2 no kernel
+  `7.1.5-76070105-generic` falha com *linux-headers not supported*): o
+  `setup-evdi.sh` detecta a falha, remove o `evdi-dkms` quebrado, baixa o último
+  release de [DisplayLink/evdi](https://github.com/DisplayLink/evdi/releases)
+  e instala via DKMS (`dkms add` → `dkms build` → `dkms install`, em
+  `/usr/src/evdi-<versão>`), mais a `libevdi` do **mesmo** release em
+  `/usr/local/lib` (a `libevdi1` da distro é removida para não misturar
+  versões). Se o release também não compilar, tenta o branch `main`.
+  Forçar: `sudo EVDI_FROM_SOURCE=1 ./scripts/setup-evdi.sh`; versão fixa:
+  `sudo EVDI_REF=v1.15.1 ./scripts/setup-evdi.sh`. Log de build:
+  `/var/lib/dkms/evdi/<versão>/build/make.log`. O DKMS recompila sozinho a cada
+  kernel novo (`AUTOINSTALL=yes`).
+
+#### Secure Boot (MOK)
+
+Com Secure Boot ativo (`mokutil --sb-state`), o kernel só carrega módulos
+assinados por uma chave cadastrada no firmware. O DKMS assina o evdi com a
+chave dele (`/var/lib/shim-signed/mok/MOK.der` no Pop/Ubuntu, ou
+`/var/lib/dkms/mok.pub`); essa chave precisa ser cadastrada **uma vez**:
+
+1. `sudo mokutil --import /var/lib/shim-signed/mok/MOK.der` (ou o caminho que
+   o `setup-evdi.sh` mostrar) — crie uma senha temporária.
+2. Reinicie. Na tela azul **"Perform MOK management"**: *Enroll MOK* →
+   *Continue* → *Yes* → digite a senha → *Reboot*. (Se o boot passar direto
+   sem a tela azul, repita o passo 1.)
+3. `sudo modprobe evdi && segunda-tela doctor`.
+
+Sintoma de chave não cadastrada: `modprobe: ERROR: could not insert 'evdi':
+Key was rejected by service`. O `setup-evdi.sh` verifica com
+`mokutil --test-key`, imprime esses passos e oferece rodar o `--import`.
 - `setup-evdi.sh` grava `/etc/modprobe.d/segunda-tela-evdi.conf`
   (`initial_device_count=1`), `/etc/modules-load.d/segunda-tela-evdi.conf` e
   `/etc/udev/rules.d/70-segunda-tela-evdi.rules` (dá ao usuário da sessão
@@ -157,7 +184,11 @@ sudo ufw allow in on p2p-wlo1-0    # DHCP do grupo P2P (o nome pode ser p2p-wlo1
 ## English summary
 
 1. `sudo ./scripts/install-deps-popos.sh && sudo ./scripts/setup-evdi.sh && ./scripts/install.sh`
-2. `segunda-tela doctor` → all `[ok]` (Secure Boot users: enroll the DKMS MOK key).
+2. `segunda-tela doctor` → all `[ok]`. If the distro `evdi-dkms` does not
+   build for your kernel, `setup-evdi.sh` falls back to the latest
+   DisplayLink/evdi GitHub release via DKMS (+ matching libevdi). With Secure
+   Boot: `sudo mokutil --import <key printed by the script>`, reboot, choose
+   *Enroll MOK* in the blue MokManager screen, enter the password.
 3. On the tablet open the wireless display receiver; `segunda-tela list`.
 4. `segunda-tela --mode extend --device "<tablet name>"` → accept the Wi-Fi
    Direct prompt on the tablet. No portal dialog: frames come straight from

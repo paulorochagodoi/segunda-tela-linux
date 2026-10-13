@@ -146,12 +146,13 @@ def cmd_doctor(_args) -> int:
     encs = [e for e in ENCODER_ORDER if gst_element_available(e)]
     line(bool(encs), "H.264 encoders", ", ".join(encs) or "none (install gstreamer1.0-plugins-bad / -vaapi / -ugly)")
     print(f"     → would use: {pick_encoder()}")
-    line(ev.module_loaded(), "evdi kernel module", "" if ev.module_loaded() else "sudo modprobe evdi")
+    line(ev.module_loaded(), "evdi kernel module", "" if ev.module_loaded() else
+         "sudo ./scripts/setup-evdi.sh (Secure Boot: cadastre a chave MOK, ver docs/COSMIC.md)")
     try:
         ev.load_libevdi()
         line(True, "libevdi")
     except ev.EvdiError:
-        line(False, "libevdi", "sudo apt install libevdi1")
+        line(False, "libevdi", "sudo ./scripts/setup-evdi.sh")
     line(bool(ev.evdi_cards()), "evdi DRM device", ev.device_node_hint())
     session = os.environ.get("XDG_SESSION_TYPE", "?")
     desktop = os.environ.get("XDG_CURRENT_DESKTOP", "?")

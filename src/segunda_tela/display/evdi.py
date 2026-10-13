@@ -79,8 +79,8 @@ class EvdiEventContext(ctypes.Structure):
 
 SETUP_HINT = (
     "EVDI indisponível. No Pop!_OS 24.04:\n"
-    "  sudo apt install evdi-dkms libevdi1\n"
-    "  sudo ./scripts/setup-evdi.sh      # modprobe + initial_device_count=1 + udev\n"
+    "  sudo ./scripts/setup-evdi.sh      # distro evdi-dkms, ou release do GitHub via DKMS;\n"
+    "                                    # modprobe + initial_device_count=1 + udev; Secure Boot/MOK\n"
     "Ver docs/COSMIC.md."
 )
 
