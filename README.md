@@ -126,6 +126,17 @@ recusava com «não é seguro». A partir da 0.3.3 fazemos como o
 gnome-network-displays: o padrão (`--no-hdcp`) não menciona proteção de
 conteúdo no M3 nem no M4. `--probe-hdcp` só serve para diagnóstico.
 
+No Galaxy Tab S10 FE 5G (0.3.3, `ab466a7`) o M1–M7 já fechava sem HDCP e o
+tablet ainda mostrava a mesma frase, com ecrã preto e TEARDOWN ~9 s depois.
+O fluxo de mídia é que falhava: o M4 não negociava áudio (a Samsung trata
+MPEG-TS só de vídeo como conteúdo inseguro) e o SETUP `19000-19001` metia
+`rtpbin` mesmo com RTCP 0 no M3, o que gerava
+`gst_mini_object_unref: assertion 'mini_object != NULL' failed`. O fluxo
+agora é o do gnome-network-displays: MPEG-TS em RTP payload 33 para a porta
+19000, H.264 no modo que o sink anunciou (no S10, 1920×1080p60), SPS/PPS
+antes de cada IDR, e uma faixa AAC silenciosa (`--audio` troca o silêncio
+pelo som do ambiente). Não há `rtpbin`.
+
 O aviso `dnsmasq … CAP_CHOWN` no journal vem do dnsmasq que o NetworkManager
 sobe para o grupo P2P (DHCP do tablet). Ele é inofensivo: o tablet recebe o IP
 normalmente.
@@ -204,10 +215,21 @@ HDCP2.x port=…` when M3 asks for it, then expect an HDCP session (Windows'
 Miracast stack runs HDCP 2.x on port 25030). We never do HDCP, so the tablet
 showed "can't display content because it's not secure". Like
 gnome-network-displays, M3 and M4 now leave content protection out entirely
-(`--no-hdcp`, the default). `--probe-hdcp` only asks, for diagnostics. Every run
-writes a rotating debug log, `~/.local/state/segunda-tela/segunda-tela.log`,
-with the verbatim RTSP exchange. `--dump-rtsp` echoes that exchange to the
-console.
+(`--no-hdcp`, the default). `--probe-hdcp` only asks, for diagnostics.
+
+A later Tab S10 FE 5G run (`ab466a7`) still showed that message after a clean
+M1–M7: the MPEG-TS had no audio (Samsung often rejects a video-only stream as
+not secure) and SETUP `client_port=19000-19001` forced `rtpbin` even though
+M3 reported RTCP port 0, which logged
+`gst_mini_object_unref: assertion 'mini_object != NULL' failed` and ended in
+TEARDOWN. The stream is now MPEG-TS over RTP payload type 33 to port 19000,
+H.264 in a mode the sink advertised (1080p60 on that tablet), SPS/PPS before
+every IDR, and a silent AAC track (`--audio` sends the desktop instead).
+There is no `rtpbin`.
+
+Every run writes a rotating debug log,
+`~/.local/state/segunda-tela/segunda-tela.log`, with the verbatim RTSP
+exchange. `--dump-rtsp` echoes that exchange to the console.
 
 License: MIT. Wi-Fi P2P/WFD behaviour was studied in GNOME Network Displays
 (GPL-3.0) as a reference only; no GND code was copied — see [NOTICE](NOTICE).

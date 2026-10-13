@@ -207,3 +207,27 @@ Fix: the default M3 is the gnome-network-displays key set. M4 never carries
 the query for diagnostics only. The full M1–M16 exchange is written verbatim
 to `~/.local/state/segunda-tela/segunda-tela.log` so the next real-device
 test confirms (or refutes) this from the tablet's actual M3 answer.
+
+## Media stream on the Tab S10 FE (after ab466a7)
+
+The same tablet, on v0.3.3 with content protection already omitted, still
+showed a black screen and "não é possível exibir o conteúdo porque não é
+seguro", then TEARDOWN about 9 s after PLAY. M1–M7 completed. Two media bugs:
+
+* M4 selected 1280×720p30 and `audio=none`. The sink had advertised CBP and
+  CHP with CEA bitmap `0001bde1` (includes 1080p60) and `AAC 00000001 00`.
+  Samsung sinks treat a video-only MPEG-TS as not secure. gnome-network-displays
+  always muxes AAC (or LPCM) on PID 0x1100.
+* SETUP echoed `client_port=19000-19001` and the pipeline used `rtpbin` even
+  though M3 said RTCP port 0. That graph hits
+  `gst_mini_object_unref: assertion 'mini_object != NULL' failed` in
+  `gst_rtp_session_send_rtp` when the send pad is missing.
+
+The stream now matches gnome-network-displays: MPEG-TS (`alignment=7`, PAT/PMT
+every 100 ms, PCR every 40 ms) over `rtpmp2tpay pt=33` to port 19000, no
+`rtpbin`, H.264 constrained-baseline (or high if that is the only codec that
+lists the mode) with `h264parse config-interval=-1`, constant frame rate, and
+a silent AAC track unless `--audio` is set. M4 echoes a resolution bit the
+sink listed (native/display size when present; on this S10 bitmap, 1920×1080p60)
+and `wfd_audio_codecs: AAC 00000001 00`. `wfd_idr_request` and an empty
+GET_PARAMETER keepalive are answered with 200.
