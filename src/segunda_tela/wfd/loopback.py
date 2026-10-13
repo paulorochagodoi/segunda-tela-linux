@@ -44,12 +44,13 @@ def run_wfd_loopback(port: int = 17236) -> bool:
         events["teardown"] = True
 
     srv = WfdRtspServer(host="127.0.0.1", port=port, advertise_host="127.0.0.1",
-                        on_play=on_play, on_teardown=on_teardown, m1_delay_s=0.1)
+                        width=1920, height=1200, on_play=on_play, on_teardown=on_teardown, m1_delay_s=0.1)
     srv.start_background()
     try:
         res = run_fake_sink("127.0.0.1", port)
         vf = res.m4_params.get("wfd_video_formats", "")
         assert vf.split()[5] == "20000000", vf  # VESA bit 29 = 1920x1200p60
+        assert res.m4_params.get("wfd_audio_codecs", "").startswith("AAC "), res.m4_params
         assert res.m4_params["wfd_client_rtp_ports"].split()[1] == "19000"
         assert res.m4_params["wfd_presentation_url"].startswith("rtsp://127.0.0.1/wfd1.0/streamid=0")
         assert res.setup_reply and res.setup_reply.status == 200

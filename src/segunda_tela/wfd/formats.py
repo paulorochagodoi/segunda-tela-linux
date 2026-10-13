@@ -372,6 +372,10 @@ class SinkCaps:
     def supports_aac(self) -> bool:
         return any(a.name == "AAC" and a.modes & AAC_48K_2CH for a in self.audio)
 
+    @property
+    def supports_lpcm48(self) -> bool:
+        return any(a.name == "LPCM" and a.modes & LPCM_48K_2CH for a in self.audio)
+
 
 def parse_sink_caps(body: str) -> SinkCaps:
     params = parse_parameters(body)
@@ -426,14 +430,62 @@ def vendor_params(params: dict[str, str]) -> dict[str, str]:
 @dataclass(frozen=True)
 class Negotiated:
     mode: VideoMode
-    level: int
+    level: int  # level byte copied into M4 (the sink codec's advertised bitmap)
     profile: int = H264_PROFILE_CBP
-    audio: Optional[str] = None  # descriptor for M4, or None (video only)
+    audio: Optional[str] = None  # M4 wfd_audio_codecs descriptor
     reason: str = ""
+    # Single level bit the encoder should target so the SPS matches the mode.
+    # Samsung often advertises level 3.1 while listing 1080p; the stream still
+    # has to be a legal H.264 level for the resolution we actually send.
+    stream_level: int = 0
+
+    @property
+    def level_idc(self) -> int:
+        bit = self.stream_level or h264_level_for(self.mode.width, self.mode.height, self.mode.fps)
+        return LEVEL_IDC.get(bit, 40)
+
+    @property
+    def gst_profile(self) -> str:
+        return "high" if self.profile == H264_PROFILE_CHP else "constrained-baseline"
+
+    @property
+    def audio_kind(self) -> Optional[str]:
+        if not self.audio:
+            return None
+        name = self.audio.split()[0].upper()
+        if name == "AAC":
+            return "aac"
+        if name == "LPCM":
+            return "lpcm"
+        return None
 
 
 def _aspect(w: int, h: int) -> float:
     return round(w / h, 2)
+
+
+def _real_native(caps: SinkVideoCaps) -> Optional[VideoMode]:
+    """Sink-declared native mode, ignoring the VGA placeholder.
+
+    Many sinks (the Galaxy Tab S10 FE included) put CEA index 0 (640x480p60)
+    in the native field while advertising 1080p. That placeholder is not a
+    preference. A native mode the bitmap actually lists, other than that
+    placeholder, is.
+    """
+    native = caps.native_mode
+    if native is None:
+        return None
+    if native.table == TABLE_CEA and native.index == 0:
+        return None
+    return native
+
+
+def _profile_of(codec: H264Codec, *, allow_chp: bool) -> int:
+    if codec.profile & H264_PROFILE_CBP:
+        return H264_PROFILE_CBP
+    if allow_chp and codec.profile & H264_PROFILE_CHP:
+        return H264_PROFILE_CHP
+    return H264_PROFILE_CBP
 
 
 def select_video(
@@ -442,43 +494,77 @@ def select_video(
     max_fps: int = 60,
     max_pixels: int = 1920 * 1200,
     target_aspect: Optional[float] = None,
-) -> tuple[VideoMode, int, str]:
-    """Pick (mode, level_bit, reason) from sink caps.
+    allow_chp: bool = True,
+) -> tuple[VideoMode, int, int, str]:
+    """Pick (mode, m4_level_byte, profile, reason) from modes the sink listed.
 
-    Policy: honour an explicit `want` size if the sink lists it; otherwise
-    prefer the sink/tablet aspect ratio (16:10 tablets → VESA 1920x1200), then
-    most pixels, then highest fps <= max_fps. No usable caps → 1080p30.
+    The H.264 level bitmap is *not* a veto. The Tab S10 FE answers M3 with
+    level 0x01 (3.1 only) while setting the 1080p60 bit; gnome-network-displays
+    still sends 1080p and the tablet displays it. Dropping those modes leaves
+    us on 720p30, which is not the panel.
+
+    Preference: the source's native size (`want`) when the sink lists it,
+    then a real sink native mode (only when `want` is absent), then aspect,
+    then most pixels and fps. Profile prefers CBP (WFD mandatory); CHP only
+    when that is all the sink offered. The returned level byte is the sink
+    codec's advertised bitmap, echoed in M4 the way gnome-network-displays does.
     """
     if caps is None or not caps.codecs:
-        return FALLBACK_MODE, h264_level_for(1920, 1080, 30), "sink sent no video caps; 1080p30 fallback"
+        return FALLBACK_MODE, h264_level_for(1920, 1080, 30), H264_PROFILE_CBP, "sink sent no video caps; 1080p30 fallback"
 
     candidates: list[tuple[VideoMode, H264Codec]] = []
     for codec in caps.codecs:
+        if not allow_chp and not (codec.profile & H264_PROFILE_CBP):
+            continue
         for mode in codec.modes():
-            if mode.fps <= max_fps and mode.pixels <= max_pixels and codec.supports_level_for(mode):
+            if mode.fps <= max_fps and mode.pixels <= max_pixels:
                 candidates.append((mode, codec))
     if not candidates:
-        return FALLBACK_MODE, h264_level_for(1920, 1080, 30), "no sink mode fits limits; 1080p30 fallback"
+        return FALLBACK_MODE, h264_level_for(1920, 1080, 30), H264_PROFILE_CBP, "no sink mode fits limits; 1080p30 fallback"
 
-    if want:
-        exact = [c for c in candidates if (c[0].width, c[0].height) == tuple(want)]
-        if exact:
-            mode, codec = max(exact, key=lambda c: c[0].fps)
-            return mode, codec.max_level, f"requested {want[0]}x{want[1]} supported by sink"
-        log.info("sink does not list %sx%s; choosing automatically", *want)
-
-    if target_aspect is None:
-        native = caps.native_mode
-        if native and native.table != TABLE_CEA:
-            target_aspect = _aspect(native.width, native.height)
+    native = _real_native(caps)
+    if target_aspect is None and native and native.table != TABLE_CEA:
+        target_aspect = _aspect(native.width, native.height)
 
     def key(c: tuple[VideoMode, H264Codec]):
-        m = c[0]
-        aspect_ok = target_aspect is not None and abs(_aspect(m.width, m.height) - target_aspect) < 0.02
-        return (aspect_ok, m.pixels, m.fps)
+        mode = c[0]
+        exact = bool(want) and (mode.width, mode.height) == (want[0], want[1])
+        inside = bool(want) and mode.width <= want[0] and mode.height <= want[1]
+        native_hit = (not want) and native is not None and mode == native
+        aspect_ok = target_aspect is not None and abs(_aspect(mode.width, mode.height) - target_aspect) < 0.02
+        # CBP wins ties so both descriptors of the same mode don't flip to CHP.
+        cbp = 1 if c[1].profile & H264_PROFILE_CBP else 0
+        return (exact, inside, native_hit, aspect_ok, mode.pixels, mode.fps, cbp)
 
     mode, codec = max(candidates, key=key)
-    return mode, codec.max_level, "best sink mode" + (f" for aspect {target_aspect}" if target_aspect else "")
+    profile = _profile_of(codec, allow_chp=allow_chp)
+    if want and (mode.width, mode.height) == (want[0], want[1]):
+        reason = f"requested {want[0]}x{want[1]} supported by sink"
+    elif (not want) and native is not None and mode == native:
+        reason = "sink native mode"
+    else:
+        reason = "best sink mode" + (f" for aspect {target_aspect}" if target_aspect else "")
+    if not codec.supports_level_for(mode):
+        reason += f"; sink level 0x{codec.level:02x} is below this mode"
+        log.info(
+            "sink lists %s but H.264 level byte 0x%02x cannot carry it; "
+            "M4 echoes that byte, the encoder targets the mode's real level",
+            mode, codec.level,
+        )
+    return mode, codec.level, profile, reason
+
+
+def select_audio(sink: SinkCaps) -> Optional[str]:
+    """One audio codec the sink advertised. AAC 48 kHz stereo, else LPCM 48 kHz.
+
+    Samsung sinks treat a program with no audio elementary stream as content
+    that is "not secure" and tear it down. A silent track is enough.
+    """
+    if sink.supports_aac:
+        return f"AAC {AAC_48K_2CH:08x} 00"
+    if sink.supports_lpcm48:
+        return f"LPCM {LPCM_48K_2CH:08x} 00"
+    return None
 
 
 def negotiate(
@@ -487,7 +573,8 @@ def negotiate(
     max_fps: int = 60,
     max_pixels: int = 1920 * 1200,
     target_aspect: Optional[float] = None,
-    audio: bool = False,
+    audio: bool = True,
+    encoder: str = "auto",
 ) -> Negotiated:
     if target_aspect is None and sink.edid:
         from ..display.edid import parse_edid
@@ -495,9 +582,15 @@ def negotiate(
         info = parse_edid(sink.edid)
         if info and info.preferred:
             target_aspect = _aspect(info.preferred[0], info.preferred[1])
-    mode, level, reason = select_video(sink.video, want, max_fps, max_pixels, target_aspect)
-    audio_desc = f"AAC {AAC_48K_2CH:08x} 00" if audio and sink.supports_aac else None
-    return Negotiated(mode=mode, level=level, audio=audio_desc, reason=reason)
+    allow_chp = encoder != "openh264enc"
+    mode, level, profile, reason = select_video(
+        sink.video, want, max_fps, max_pixels, target_aspect, allow_chp=allow_chp,
+    )
+    audio_desc = select_audio(sink) if audio else None
+    return Negotiated(
+        mode=mode, level=level, profile=profile, audio=audio_desc, reason=reason,
+        stream_level=h264_level_for(mode.width, mode.height, mode.fps),
+    )
 
 
 def m4_video_descriptor(mode: VideoMode, level: int, profile: int = H264_PROFILE_CBP) -> str:

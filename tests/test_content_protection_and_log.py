@@ -50,7 +50,10 @@ def test_probe_hdcp_asks_but_m4_still_omits_it():
     res = _run(17312, {"content_protection": SAMSUNG_HDCP}, probe_hdcp=True)
     assert "wfd_content_protection" in res.m3.body.split()
     assert "wfd_content_protection" not in res.m4.body
-    assert set(res.m4_params) == {"wfd_video_formats", "wfd_presentation_url", "wfd_client_rtp_ports"}
+    assert set(res.m4_params) == {
+        "wfd_video_formats", "wfd_audio_codecs", "wfd_presentation_url", "wfd_client_rtp_ports",
+    }
+    assert "wfd_content_protection" not in res.m4_params
 
 
 def test_sink_caps_hdcp_and_vendor_params():

@@ -49,6 +49,7 @@ class SecondScreenSession:
         self.display: Optional[VirtualDisplay] = None
         self.server: Optional[WfdRtspServer] = None
         self.pipeline: Optional[StreamPipeline] = None
+        self._idr_pending = False
         self.last_state: Optional[SessionState] = None
         self.usb_initiator = None
         self._plock = threading.Lock()
@@ -127,9 +128,13 @@ class SecondScreenSession:
             fps=self.fps,
             on_play=self._on_play,
             on_teardown=self._on_teardown,
+            on_idr_request=self._on_idr,
             want_size=self.want_size,
             max_fps=self.fps,
-            audio=self.audio,
+            # Always negotiate an audio elementary stream when the sink offers
+            # one. `--audio` only switches that track from silence to the desktop.
+            audio=True,
+            encoder=self.encoder,
             probe_hdcp=self.probe_hdcp,
         )
         self.server.start_background()
@@ -144,23 +149,37 @@ class SecondScreenSession:
         with self._plock:
             if self.pipeline:
                 self.pipeline.stop()
+            negotiated = state.negotiated
             self.pipeline = StreamPipeline(
                 capture_source=self.display.new_capture(),
                 dest_host=state.rtp_host,
                 dest_port=state.rtp_port,
-                rtcp_port=state.rtcp_port,
+                rtcp_port=0,  # RTP only; RTCP/rtpbin trips gst_mini_object_unref
                 local_rtp_port=self.server.server_rtp_port if self.server else 19100,
                 width=mode.width,
                 height=mode.height,
                 bitrate_kbps=bitrate,
                 fps=mode.fps,
                 encoder=self.encoder,
-                audio_source=AUDIO_SOURCE if state.negotiated and state.negotiated.audio else None,
+                audio=negotiated.audio if negotiated else None,
+                audio_source=AUDIO_SOURCE if self.audio and negotiated and negotiated.audio else None,
+                profile=negotiated.gst_profile if negotiated else "constrained-baseline",
+                level_idc=negotiated.level_idc if negotiated else None,
             )
             try:
                 self.pipeline.start()
+                if self._idr_pending:
+                    self.pipeline.request_idr()
+                    self._idr_pending = False
             except Exception as exc:  # noqa: BLE001
                 log.error("Failed to start pipeline: %s", exc)
+
+    def _on_idr(self, state: SessionState) -> None:
+        with self._plock:
+            if self.pipeline and self.pipeline.request_idr():
+                return
+            self._idr_pending = True
+            log.info("IDR request queued until the stream is playing")
 
     def _on_teardown(self, state: SessionState) -> None:
         log.info("TEARDOWN/PAUSE from %s", state.remote)

@@ -26,11 +26,13 @@ def test_wfd_flow_default_tablet():
         srv.stop()
     m3_keys = res.m3.body.split()
     assert {"wfd_video_formats", "wfd_audio_codecs", "wfd_client_rtp_ports"} <= set(m3_keys)
-    assert "wfd_audio_codecs" not in res.m4_params  # video only
+    assert res.m4_params["wfd_audio_codecs"] == "AAC 00000001 00"
     assert res.setup_reply.headers["transport"].startswith("RTP/AVP/UDP;unicast;client_port=19000")
     assert ";timeout=30" in res.setup_reply.headers["session"]
     mode, rtp, rtcp = ev["play"][0]
-    assert (mode.width, mode.height, mode.fps, rtp, rtcp) == (1920, 1200, 60, 19000, 0)
+    # Server display is 1920x1080 and the fixture lists it, so that wins over 1200p.
+    # SETUP still offers client_port=19000-19001; RTCP stays off (M3 said 0).
+    assert (mode.width, mode.height, mode.fps, rtp, rtcp) == (1920, 1080, 60, 19000, 0)
     assert ev["teardown"] == 1
 
 
@@ -56,6 +58,79 @@ def test_wfd_flow_requested_size_fps_and_audio_rtcp():
     assert res.m4_params["wfd_client_rtp_ports"] == "RTP/AVP/UDP;unicast 1028 1029 mode=play"
     mode, rtp, rtcp = ev["play"][0]
     assert (mode.fps, rtp, rtcp) == (30, 1028, 1029)
+
+
+# Galaxy Tab S10 FE 5G, Wi-Fi Direct, 2026-10-13. Level byte is only 3.1 but
+# the CEA bitmap includes 1080p60. Audio is LPCM 48k + AAC. RTCP port 0.
+S10_VIDEO = (
+    "00 00 01 01 0001bde1 00300000 000003c0 00 0000 0000 0f none none, "
+    "02 01 0001bde1 00300000 000003c0 00 0000 0000 0f none none"
+)
+S10_AUDIO = "LPCM 00000002 00, AAC 00000001 00"
+
+
+def test_galaxy_tab_s10_m4_picks_1080p_and_aac():
+    idrs = []
+    srv, ev = _server(17306, width=1920, height=1200, on_idr_request=lambda st: idrs.append(st.remote))
+    try:
+        res = run_fake_sink(
+            "127.0.0.1", 17306,
+            video_formats=S10_VIDEO, audio_codecs=S10_AUDIO,
+            idr_request=True, sink_keepalive=True,
+        )
+    finally:
+        srv.stop()
+    fields = res.m4_params["wfd_video_formats"].split()
+    # CBP, echoed level 0x01, CEA bit 8 = 1920x1080p60 (closest to 1920x1200).
+    assert fields[2] == "01" and fields[3] == "01"
+    assert fields[4] == "00000100" and fields[5] == "00000000"
+    assert res.m4_params["wfd_audio_codecs"] == "AAC 00000001 00"
+    assert "wfd_content_protection" not in res.m4.body
+    mode, rtp, rtcp = ev["play"][0]
+    assert (mode.width, mode.height, mode.fps, rtp, rtcp) == (1920, 1080, 60, 19000, 0)
+    assert res.idr_reply is not None and res.idr_reply.status == 200
+    assert res.idr_reply.headers.get("session")
+    assert idrs == ["127.0.0.1"]
+    assert res.sink_keepalive_reply is not None and res.sink_keepalive_reply.status == 200
+    assert res.sink_keepalive_reply.body.strip() == ""
+    assert res.sink_keepalive_reply.headers.get("session")
+
+
+def test_bare_idr_request_line_is_answered():
+    from segunda_tela.wfd.fakesink import FakeSink
+
+    idrs = []
+    srv, _ev = _server(17307, on_idr_request=lambda st: idrs.append(True))
+    try:
+        res = run_fake_sink("127.0.0.1", 17307, video_formats="none", audio_codecs="none")
+        # The helper already tore the session down. Drive a second one and send
+        # the bare parameter (no colon) before teardown by using FakeSink below.
+    finally:
+        srv.stop()
+    assert res.m4_params.get("wfd_audio_codecs") is None
+
+    srv, _ev = _server(17308, on_idr_request=lambda st: idrs.append(True))
+    s = FakeSink("127.0.0.1", 17308)
+    try:
+        m1 = s.expect_request("OPTIONS")
+        s.reply(m1, {"Public": "org.wfa.wfd1.0, SET_PARAMETER, GET_PARAMETER"})
+        s.request("OPTIONS", "*", {"Require": "org.wfa.wfd1.0"})
+        m3 = s.expect_request("GET_PARAMETER")
+        s.reply(m3, body="wfd_video_formats: none\r\nwfd_audio_codecs: none\r\nwfd_client_rtp_ports: RTP/AVP/UDP;unicast 19000 0 mode=play\r\n")
+        m4 = s.expect_request("SET_PARAMETER")
+        s.reply(m4)
+        m5 = s.expect_request("SET_PARAMETER")
+        s.reply(m5)
+        url = "rtsp://127.0.0.1/wfd1.0/streamid=0"
+        setup = s.request("SETUP", url, {"Transport": "RTP/AVP/UDP;unicast;client_port=19000-19001"})
+        session = setup.headers["session"].split(";")[0]
+        s.request("PLAY", url, {"Session": session})
+        bare = s.request("SET_PARAMETER", "rtsp://localhost/wfd1.0", {"Session": session}, body="wfd_idr_request\r\n")
+        assert bare.status == 200
+        assert idrs == [True]
+    finally:
+        s.close()
+        srv.stop()
 
 
 def test_wfd_keepalive_m16():

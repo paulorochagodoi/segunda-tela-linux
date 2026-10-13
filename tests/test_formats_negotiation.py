@@ -39,22 +39,31 @@ def test_parse_none_and_garbage():
 
 
 def test_select_prefers_1200p60_for_tablet():
-    mode, level, _ = select_video(parse_video_formats(TABLET_VIDEO_FORMATS))
+    # The display's own size wins when the sink lists it (session passes this).
+    mode, level, profile, _ = select_video(parse_video_formats(TABLET_VIDEO_FORMATS), want=(1920, 1200))
     assert (mode.width, mode.height, mode.fps) == (1920, 1200, 60)
     assert mode.table == TABLE_VESA and mode.index == 29
-    assert level == 0x10
+    assert level == 0x10 and profile == 1
+
+
+def test_select_without_want_uses_real_sink_native():
+    # Fixture native byte 0x28 is CEA #5 (720p30), not the VGA placeholder.
+    mode, level, profile, reason = select_video(parse_video_formats(TABLET_VIDEO_FORMATS))
+    assert (mode.width, mode.height, mode.fps) == (1280, 720, 30)
+    assert "native" in reason
+    assert level == 0x10 and profile == 1
 
 
 def test_select_respects_max_fps_and_want():
     caps = parse_video_formats(TABLET_VIDEO_FORMATS)
-    mode, _, _ = select_video(caps, max_fps=30)
+    mode, _, _, _ = select_video(caps, max_fps=30, want=(1920, 1200))
     assert (mode.width, mode.height, mode.fps) == (1920, 1200, 30)
-    mode, _, reason = select_video(caps, want=(1920, 1080))
+    mode, _, _, reason = select_video(caps, want=(1920, 1080))
     assert (mode.width, mode.height, mode.fps) == (1920, 1080, 60)
     assert mode.table == TABLE_CEA and mode.index == 8
     assert "requested" in reason
-    # 2560x1600 cannot be signalled in WFD R1 → automatic choice instead
-    mode, _, _ = select_video(caps, want=(2560, 1600))
+    # 2560x1600 cannot be signalled in WFD R1 → largest listed mode that fits
+    mode, _, _, _ = select_video(caps, want=(2560, 1600))
     assert (mode.width, mode.height) == (1920, 1200)
 
 
@@ -62,15 +71,17 @@ def test_select_fallbacks():
     assert select_video(None)[0] == FALLBACK_MODE
     assert FALLBACK_MODE.width == 1920 and FALLBACK_MODE.height == 1080
     caps = parse_video_formats("00 00 01 01 00000001 00000000 00000000 00 0000 0000 00 none none")
-    mode, _, _ = select_video(caps)
+    mode, _, _, _ = select_video(caps)
     assert (mode.width, mode.height) == (640, 480)  # only the mandatory mode
 
 
-def test_select_level_limits():
-    # Level 3.1 cannot carry 1080p: best is 720p30 (CEA 5).
+def test_select_level_byte_does_not_drop_listed_modes():
+    # Level 3.1 cannot *carry* 1080p, but the Tab S10 FE lists 1080p with
+    # level byte 0x01 anyway. The bitmap wins; M4 echoes 0x01.
     caps = parse_video_formats(f"00 00 01 {H264_LEVEL_31:02x} 000001ff 00000000 00000000 00 0000 0000 00 none none")
-    mode, _, _ = select_video(caps)
-    assert (mode.width, mode.height, mode.fps) == (1280, 720, 30)
+    mode, level, profile, _ = select_video(caps, want=(1920, 1080))
+    assert (mode.width, mode.height, mode.fps) == (1920, 1080, 60)
+    assert level == H264_LEVEL_31 and profile == 1
 
 
 def test_aspect_preference_from_native():
@@ -78,7 +89,7 @@ def test_aspect_preference_from_native():
     # 1080p-ish area, prefer 16:10 over a bigger 16:9.
     caps = parse_video_formats("d9 00 01 10 000001ff 0c000000 00000000 00 0000 0000 00 none none")
     assert caps.native_mode.width == 1680
-    mode, _, _ = select_video(caps)
+    mode, _, _, _ = select_video(caps)
     assert (mode.width, mode.height) == (1680, 1050)
 
 
@@ -112,8 +123,10 @@ def test_audio_and_sink_caps():
     assert caps.rtp_port == 19000 and caps.rtcp_port == 0
     assert caps.supports_aac and caps.idr_request
     n = negotiate(caps)
-    assert n.audio is None  # video-only unless --audio
-    assert negotiate(caps, audio=True).audio == "AAC 00000001 00"
+    assert n.audio == "AAC 00000001 00"  # Samsung rejects a program with no audio
+    assert negotiate(caps, audio=False).audio is None
+    lpcm = parse_sink_caps("wfd_audio_codecs: LPCM 00000002 00\r\n")
+    assert negotiate(lpcm).audio == "LPCM 00000002 00"
 
 
 def test_display_edid_drives_aspect():

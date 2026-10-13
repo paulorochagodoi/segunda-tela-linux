@@ -138,9 +138,10 @@ sudo ufw allow in on p2p-wlo1-0    # DHCP do grupo P2P (o nome pode ser p2p-wlo1
   [SAMSUNG_MCF.md](SAMSUNG_MCF.md).
 - **1920x1200 (VESA)**: alguns sinks anunciam VESA mas só aceitam CEA. Se o
   tablet recusar o M4, tentamos de novo automaticamente com 1080p30.
-- **Pedido de IDR do tablet** (`wfd_idr_request`): como o encoder roda em
-  `gst-launch`, não forçamos keyframe sob demanda; o GOP é de 1 s para
-  recuperar rápido.
+- **Pedido de IDR do tablet** (`wfd_idr_request`): com os bindings Gst
+  instalados o processo filho (`python -m segunda_tela.wfd.gst_run`) manda
+  um `GstForceKeyUnit` ao `h264parse`. Sem os bindings caímos no
+  `gst-launch` e o GOP de 1 s é que recupera a imagem.
 
 ---
 

@@ -30,6 +30,8 @@ class FakeSinkResult:
     setup_reply: Optional[RtspMessage] = None
     play_reply: Optional[RtspMessage] = None
     keepalive: Optional[RtspMessage] = None
+    idr_reply: Optional[RtspMessage] = None
+    sink_keepalive_reply: Optional[RtspMessage] = None
     teardown_reply: Optional[RtspMessage] = None
 
 
@@ -90,6 +92,8 @@ def run_fake_sink(
     content_protection: str = "none",
     vendor: dict[str, str] | None = None,
     wait_keepalive: bool = False,
+    idr_request: bool = False,
+    sink_keepalive: bool = False,
     timeout: float = 5.0,
     sock: Optional[socket.socket] = None,
 ) -> FakeSinkResult:
@@ -128,10 +132,29 @@ def run_fake_sink(
         s.reply(res.m5)
 
         url = res.m4_params.get("wfd_presentation_url", "rtsp://localhost/wfd1.0/streamid=0").split()[0]
-        rtp = rtp_ports.split()[1]
-        res.setup_reply = s.request("SETUP", url, {"Transport": f"RTP/AVP/UDP;unicast;client_port={rtp}"})
+        nums = [tok for tok in rtp_ports.split() if tok.isdigit()]
+        rtp = nums[0] if nums else "19000"
+        second = nums[1] if len(nums) > 1 else "0"
+        # Samsung SETUP always offers a range (19000-19001) even when M3 said
+        # the RTCP port is 0. The source must not treat that as "RTCP on".
+        if second in ("0", rtp):
+            client_port = f"{rtp}-{int(rtp) + 1}"
+        else:
+            client_port = f"{rtp}-{second}"
+        res.setup_reply = s.request("SETUP", url, {"Transport": f"RTP/AVP/UDP;unicast;client_port={client_port}"})
         session = res.setup_reply.headers.get("session", "").split(";")[0]
         res.play_reply = s.request("PLAY", url.rsplit("/streamid", 1)[0], {"Session": session})
+
+        if idr_request:
+            res.idr_reply = s.request(
+                "SET_PARAMETER", "rtsp://localhost/wfd1.0",
+                {"Session": session, "Content-Type": "text/parameters"},
+                body="wfd_idr_request: 1\r\n",
+            )
+        if sink_keepalive:
+            res.sink_keepalive_reply = s.request(
+                "GET_PARAMETER", "rtsp://localhost/wfd1.0", {"Session": session},
+            )
 
         if wait_keepalive:
             res.keepalive = s.expect_request("GET_PARAMETER")

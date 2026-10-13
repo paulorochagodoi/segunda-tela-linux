@@ -63,7 +63,12 @@ def build_parser() -> argparse.ArgumentParser:
         default="auto",
         help="H.264 encoder: auto|vah264enc|vaapih264enc|x264enc|openh264enc",
     )
-    p.add_argument("--audio", action="store_true", help="Also send desktop audio (AAC) if the sink supports it")
+    p.add_argument(
+        "--audio",
+        action="store_true",
+        help="Send desktop audio. A silent AAC/LPCM track is already negotiated when the sink offers one "
+        "(Samsung treats a video-only MPEG-TS as not secure)",
+    )
     p.add_argument("--port", type=int, default=7236, help="WFD RTSP port (default 7236)")
     p.add_argument("--bind", default="0.0.0.0")
     p.add_argument("--ui", action="store_true", help="Launch GTK UI")

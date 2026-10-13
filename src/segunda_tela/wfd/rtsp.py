@@ -175,6 +175,7 @@ class SessionState:
     height: int = 1080
     fps: int = 30
     playing: bool = False
+    setup_done: bool = False
     cseq: int = 0
     remote: str = ""
     local: str = ""
@@ -432,39 +433,49 @@ class _Handler(socketserver.BaseRequestHandler):
 
         if method == "GET_PARAMETER":
             keys = requested_keys(msg.body)
-            if not keys:
-                self._reply(msg)  # keep-alive
-            else:
-                self._reply(msg, body=self._source_params(keys))
+            # Empty body is the WFD keep-alive (M16 from the sink, or a reply
+            # we must answer). Echo Session once SETUP has completed.
+            self._reply(msg, extra=self._session_header(), body="" if not keys else self._source_params(keys))
             return
 
         if method == "SET_PARAMETER":
             params = parse_parameters(msg.body)
-            if "wfd_idr_request" in params:
-                log.info("sink requested IDR (GOP is 1 s, next keyframe soon)")
+            bare = {line.strip().lower() for line in msg.body.splitlines() if line.strip() and ":" not in line}
+            if "wfd_idr_request" in params or "wfd_idr_request" in bare:
+                log.info("sink requested IDR")
                 if self.server.on_idr_request:
                     self.server.on_idr_request(st)
             if "wfd_client_rtp_ports" in params:
                 st.rtp_port, st.rtcp_port = parse_client_rtp_ports(params["wfd_client_rtp_ports"])
-            self._reply(msg)
+            self._reply(msg, extra=self._session_header())
             return
 
         if method == "SETUP":
             transport = msg.headers.get("transport", "")
+            requested_client = ""
             if "client_port=" in transport:
+                requested_client = transport.split("client_port=", 1)[1].split(";", 1)[0]
                 try:
-                    ports = transport.split("client_port=")[1].split(";")[0].split("-")
+                    ports = requested_client.split("-")
                     st.rtp_port = int(ports[0])
-                    if len(ports) > 1 and int(ports[1]) not in (0, st.rtp_port):
+                    # Samsung SETUP is `client_port=19000-19001` even when M3
+                    # said RTCP port 0. Honouring that range turned RTCP on and
+                    # pulled rtpbin into the pipeline (the mini_object critical).
+                    m3_rtcp = st.sink.rtcp_port if st.sink is not None else None
+                    if m3_rtcp == 0:
+                        st.rtcp_port = 0
+                    elif len(ports) > 1 and int(ports[1]) not in (0, st.rtp_port):
                         st.rtcp_port = int(ports[1])
                 except ValueError:
                     pass
+            st.setup_done = True
             sp = self.server.server_rtp_port
-            client = f"{st.rtp_port}" + (f"-{st.rtcp_port}" if st.rtcp_port else "")
+            if not requested_client:
+                requested_client = f"{st.rtp_port}" + (f"-{st.rtcp_port}" if st.rtcp_port else "")
             self._reply(
                 msg,
                 extra={
-                    "Transport": f"RTP/AVP/UDP;unicast;client_port={client};server_port={sp}-{sp + 1}",
+                    "Transport": f"RTP/AVP/UDP;unicast;client_port={requested_client};server_port={sp}-{sp + 1}",
                     "Session": f"{st.session_id};timeout={SESSION_TIMEOUT_S}",
                 },
             )
@@ -502,6 +513,11 @@ class _Handler(socketserver.BaseRequestHandler):
             return
 
         self._reply(msg, 501, "Not Implemented")
+
+    def _session_header(self) -> Optional[dict]:
+        if self.state.setup_done:
+            return {"Session": self.state.session_id}
+        return None
 
     def _source_params(self, keys: list[str]) -> str:
         st = self.state
@@ -559,7 +575,8 @@ class WfdRtspServer(socketserver.ThreadingTCPServer):
         want_size: Optional[tuple[int, int]] = None,
         max_fps: int = 60,
         max_pixels: int = 1920 * 1200,
-        audio: bool = False,
+        audio: bool = True,
+        encoder: str = "auto",
         probe_hdcp: bool = False,
         m1_delay_s: float = 0.5,
         keepalive_s: float = KEEPALIVE_S,
@@ -578,6 +595,7 @@ class WfdRtspServer(socketserver.ThreadingTCPServer):
         self.max_fps = max_fps
         self.max_pixels = max_pixels
         self.audio = audio
+        self.encoder = encoder
         self.probe_hdcp = probe_hdcp  # only *ask* the sink about HDCP (diagnostics); never select it
         self.m1_delay_s = m1_delay_s
         self.keepalive_s = keepalive_s
@@ -589,8 +607,12 @@ class WfdRtspServer(socketserver.ThreadingTCPServer):
         self._hlock = threading.Lock()
 
     def negotiate(self, sink: SinkCaps) -> Negotiated:
-        return negotiate(sink, want=self.want_size, max_fps=self.max_fps,
-                         max_pixels=self.max_pixels, audio=self.audio)
+        # Prefer the virtual display's own size when the user did not pass
+        # --width/--height. That is the "native" resolution we can actually
+        # show; it wins only if the sink's wfd_video_formats lists it.
+        want = self.want_size or ((self.width, self.height) if self.width and self.height else None)
+        return negotiate(sink, want=want, max_fps=self.max_fps, max_pixels=self.max_pixels,
+                         audio=self.audio, encoder=self.encoder)
 
     def _register(self, h: _Handler) -> None:
         with self._hlock:
