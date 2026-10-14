@@ -342,7 +342,7 @@ class _Handler(socketserver.BaseRequestHandler):
         if self._m3_sent:
             return
         self._m3_sent = True
-        body = "\r\n".join(m3_query_keys(self.server.probe_hdcp)) + "\r\n"
+        body = "\r\n".join(m3_query_keys(self.server.probe_hdcp, touch=self.server.touch)) + "\r\n"
         self._request("GET_PARAMETER", "rtsp://localhost/wfd1.0", "M3", body=body,
                       extra={"Content-Type": "text/parameters"})
 
@@ -356,10 +356,27 @@ class _Handler(socketserver.BaseRequestHandler):
             lines.append(f"wfd_audio_codecs: {n.audio}")
         lines.append(f"wfd_presentation_URL: {st.url} none")
         lines.append(f"wfd_client_rtp_ports: RTP/AVP/UDP;unicast {st.rtp_port} {st.rtcp_port} mode=play")
+        uibc_lines = self._uibc_m4_lines(st)
+        if uibc_lines:
+            lines.extend(uibc_lines)
         # No wfd_content_protection here, ever: naming it in M4 selects HDCP, which we don't implement.
         assert not any(line.startswith(M3_HDCP_PROBE_KEY) for line in lines)
         self._request("SET_PARAMETER", "rtsp://localhost/wfd1.0", "M4", body="\r\n".join(lines) + "\r\n",
                       extra={"Content-Type": "text/parameters"})
+
+    def _uibc_m4_lines(self, st: SessionState) -> list[str]:
+        srv = self.server
+        caps = getattr(st.sink, "uibc", None) if st.sink is not None else None
+        if not srv.touch or not srv.uibc_port or caps is None or not getattr(caps, "usable", False):
+            return []
+        if srv.uibc is not None and st.remote:
+            srv.uibc.allow(st.remote)
+        from .uibc import m4_uibc_parameters
+
+        lines = m4_uibc_parameters(caps, srv.uibc_port)
+        if lines:
+            log.info("M4 UIBC %s", lines[0].split(": ", 1)[-1])
+        return lines
 
     def _send_m5(self, method: str = "SETUP") -> None:
         self._request("SET_PARAMETER", "rtsp://localhost/wfd1.0", f"M5-{method}",
@@ -411,6 +428,8 @@ class _Handler(socketserver.BaseRequestHandler):
                 log.info("M3 sink %s: %s", key, raw[key])
         if "wfd_display_edid" in raw:
             log.info("M3 sink wfd_display_edid: %s", "present" if sink.edid else raw["wfd_display_edid"])
+        if "wfd_uibc_capability" in raw:
+            log.info("M3 sink wfd_uibc_capability: %s", raw["wfd_uibc_capability"])
         extra = vendor_params(raw)
         if extra:
             log.info("M3 sink vendor-specific params: %s", extra)
@@ -449,6 +468,9 @@ class _Handler(socketserver.BaseRequestHandler):
                     self.server.on_idr_request(st)
             if "wfd_client_rtp_ports" in params:
                 st.rtp_port, st.rtcp_port = parse_client_rtp_ports(params["wfd_client_rtp_ports"])
+            if "wfd_uibc_setting" in params and self.server.uibc is not None:
+                enabled = params["wfd_uibc_setting"].strip().lower() != "disable"
+                self.server.uibc.set_enabled(enabled)
             self._reply(msg, extra=self._session_header())
             return
 
@@ -582,6 +604,9 @@ class WfdRtspServer(socketserver.ThreadingTCPServer):
         probe_hdcp: bool = False,
         gnd_compat: bool = False,
         force_1080p30: bool = False,
+        touch: bool = False,
+        uibc_port: int = 0,
+        uibc: Optional[object] = None,
         m1_delay_s: float = 0.5,
         keepalive_s: float = KEEPALIVE_S,
     ) -> None:
@@ -607,6 +632,11 @@ class WfdRtspServer(socketserver.ThreadingTCPServer):
         # --resolution 1080: 1920x1080p30 and SPS level 4.0, even when the
         # sink's level byte is only 3.1. GND sends this mode to the Tab S10 FE.
         self.force_1080p30 = force_1080p30
+        # Touch is off unless the session has a UIBC listener. M3 then asks
+        # wfd_uibc_capability; M4 names the port only when the sink advertised touch.
+        self.touch = touch
+        self.uibc_port = uibc_port
+        self.uibc = uibc
         self.m1_delay_s = m1_delay_s
         self.keepalive_s = keepalive_s
         # RTP destination for sinks that reach us via loopback (`adb reverse`):

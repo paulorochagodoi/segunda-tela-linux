@@ -391,6 +391,8 @@ class SinkCaps:
     rtcp_port: int = 0
     edid: Optional[bytes] = None
     idr_request: bool = False
+    # Parsed wfd_uibc_capability. None when the sink was not asked or did not answer.
+    uibc: Optional[object] = None
     raw: dict[str, str] = field(default_factory=dict)
 
     @property
@@ -420,6 +422,10 @@ def parse_sink_caps(body: str) -> SinkCaps:
         caps.rtp_port, caps.rtcp_port = parse_client_rtp_ports(params["wfd_client_rtp_ports"])
     caps.edid = parse_display_edid(params.get("wfd_display_edid", ""))
     caps.idr_request = params.get("wfd_idr_request_capability", "").strip() == "1"
+    if "wfd_uibc_capability" in params:
+        from .uibc import parse_uibc_capability
+
+        caps.uibc = parse_uibc_capability(params["wfd_uibc_capability"])
     return caps
 
 
@@ -454,9 +460,18 @@ STANDARD_PARAMS = frozenset({
 })
 
 
-def m3_query_keys(probe_hdcp: bool = False) -> tuple[str, ...]:
-    """Keys for the M3 GET_PARAMETER body. `probe_hdcp` adds wfd_content_protection (diagnostics only)."""
-    return M3_QUERY_KEYS + ((M3_HDCP_PROBE_KEY,) if probe_hdcp else ())
+def m3_query_keys(probe_hdcp: bool = False, touch: bool = False) -> tuple[str, ...]:
+    """Keys for the M3 GET_PARAMETER body.
+
+    `touch` appends `wfd_uibc_capability` (finger / S Pen). `probe_hdcp` stays
+    last and is diagnostics only — it is not part of a normal M3.
+    """
+    keys = M3_QUERY_KEYS
+    if touch:
+        keys = keys + ("wfd_uibc_capability",)
+    if probe_hdcp:
+        keys = keys + (M3_HDCP_PROBE_KEY,)
+    return keys
 
 
 def vendor_params(params: dict[str, str]) -> dict[str, str]:

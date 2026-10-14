@@ -7,6 +7,7 @@
 #  - explica o cadastro da chave MOK quando o Secure Boot está ativo
 #  - carrega o módulo com 1 dispositivo genérico, também em todo boot
 #  - regra udev "uaccess" para o usuário da sessão abrir /dev/dri/cardN do evdi
+#    e /dev/uinput (toque do tablet na saída EVDI)
 #
 # Variáveis:
 #   EVDI_FROM_SOURCE=1   pula o pacote da distro e vai direto ao GitHub
@@ -198,7 +199,15 @@ echo evdi > /etc/modules-load.d/segunda-tela-evdi.conf
 cat > /etc/udev/rules.d/70-segunda-tela-evdi.rules <<'RULES'
 SUBSYSTEM=="drm", KERNEL=="card*", DRIVERS=="evdi", TAG+="uaccess"
 RULES
+
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+UINPUT_RULE="$ROOT/packaging/udev/71-segunda-tela-uinput.rules"
+if [[ -f "$UINPUT_RULE" ]]; then
+  install -m 0644 "$UINPUT_RULE" /etc/udev/rules.d/71-segunda-tela-uinput.rules
+  echo "udev: /dev/uinput para o usuário da sessão (toque na saída EVDI)"
+fi
 udevadm control --reload-rules
+udevadm trigger --subsystem-match=misc --sysname-match=uinput || true
 
 if ! lsmod | grep -q '^evdi'; then
   if ! err="$(modprobe evdi initial_device_count=1 2>&1)"; then

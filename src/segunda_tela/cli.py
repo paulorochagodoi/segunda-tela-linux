@@ -81,6 +81,13 @@ def build_parser() -> argparse.ArgumentParser:
         "(Samsung treats a video-only MPEG-TS as not secure)",
     )
     p.add_argument(
+        "--no-touch",
+        action="store_true",
+        help="Do not negotiate WFD UIBC or inject finger/S Pen events. "
+             "By default the source asks wfd_uibc_capability, listens for generic and HIDC "
+             "multitouch (and Samsung TCP 50000), and injects contacts on the EVDI output only.",
+    )
+    p.add_argument(
         "--gnd-compat",
         action="store_true",
         help="Literal gnome-network-displays resolution: always 1920x1080p30, and do not force the "
@@ -177,6 +184,9 @@ def cmd_doctor(_args) -> int:
     except ev.EvdiError:
         line(False, "libevdi", "sudo ./scripts/setup-evdi.sh")
     line(bool(ev.evdi_cards()), "evdi DRM device", ev.device_node_hint())
+    uinput = os.access("/dev/uinput", os.W_OK)
+    print(f"[{'ok' if uinput else '..'}] /dev/uinput"
+          + ("" if uinput else " — sudo ./scripts/setup-evdi.sh (then log out and back in) for touch"))
     session = os.environ.get("XDG_SESSION_TYPE", "?")
     desktop = os.environ.get("XDG_CURRENT_DESKTOP", "?")
     print(f"[..] session={session} desktop={desktop}")
@@ -294,6 +304,7 @@ def main(argv: list[str] | None = None) -> int:
         probe_hdcp=args.probe_hdcp,
         gnd_compat=args.gnd_compat,
         force_1080p30=args.resolution == "1080",
+        touch=not args.no_touch,
     )
 
     # Wake the main thread with a byte. Stopping GStreamer inside this

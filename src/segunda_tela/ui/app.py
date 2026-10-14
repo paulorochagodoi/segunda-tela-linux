@@ -185,6 +185,7 @@ def run_ui(args) -> int:
                             probe_hdcp=bool(getattr(args, "probe_hdcp", False)),
                             gnd_compat=bool(getattr(args, "gnd_compat", False)),
                             force_1080p30=getattr(args, "resolution", None) == "1080",
+                            touch=not bool(getattr(args, "no_touch", False)),
                         )
                         s.start()
                         notes = "\n".join(s.notes)
