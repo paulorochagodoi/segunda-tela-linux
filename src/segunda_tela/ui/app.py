@@ -183,6 +183,9 @@ def run_ui(args) -> int:
                             rtsp_port=args.port, bitrate_kbps=args.bitrate, advertise_ip=advertise,
                             usb_link=usb_link, capture=args.capture, encoder=args.encoder, audio=args.audio,
                             probe_hdcp=bool(getattr(args, "probe_hdcp", False)),
+                            gnd_compat=bool(getattr(args, "gnd_compat", False)),
+                            force_1080p30=getattr(args, "resolution", None) == "1080",
+                            touch=not bool(getattr(args, "no_touch", False)),
                         )
                         s.start()
                         notes = "\n".join(s.notes)

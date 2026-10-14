@@ -157,13 +157,47 @@ def cea_native_index(width: int, height: int, fps: int) -> int:
     return best
 
 
+def mode_mbps(width: int, height: int, fps: int) -> int:
+    return ((width + 15) // 16) * ((height + 15) // 16) * fps
+
+
 def h264_level_for(width: int, height: int, fps: int) -> int:
     """Smallest WFD H.264 level bit whose macroblock rate covers the mode."""
-    mbps = ((width + 15) // 16) * ((height + 15) // 16) * fps
+    mbps = mode_mbps(width, height, fps)
     for bit, _idc, max_mbps in _LEVELS:
         if mbps <= max_mbps:
             return bit
     return H264_LEVEL_42
+
+
+def mode_within_level(mode: VideoMode, level_byte: int) -> bool:
+    """True when some advertised H.264 level can carry this mode's macroblock rate.
+
+    Level 0x01 is only 3.1 (108000 MB/s): 1280x720p30 fits, 720p60 (3.2) and
+    1080p (4.x) do not. A higher advertised bit may carry a lower mode.
+    """
+    cap = 0
+    highest = 0
+    for bit, _idc, max_mbps in _LEVELS:
+        if level_byte & bit and bit >= highest:
+            highest = bit
+            cap = max_mbps
+    if not highest or mode_mbps(mode.width, mode.height, mode.fps) > cap:
+        return False
+    return h264_level_for(mode.width, mode.height, mode.fps) <= highest
+
+
+def gnd_bitrate_kbps(level_byte: int, profile: int) -> int:
+    """gnome-network-displays caps the initial bitrate at 4096 kbit/s.
+
+    The per-level table is the one in wfd_video_codec_get_max_bitrate_kbit;
+    every defined level is then clamped with MIN(..., 512 * 8).
+    """
+    table = {0x01: 14000, 0x02: 20000, 0x04: 20000, 0x08: 50000, 0x10: 50000}
+    bitrate = table.get(level_byte, 14000)
+    if profile == H264_PROFILE_CHP:
+        bitrate = int(bitrate * 1.25)
+    return min(bitrate, 4096)
 
 
 def wfd_video_formats(width: int, height: int, fps: int, profile: int = H264_PROFILE_CBP) -> str:
@@ -232,7 +266,7 @@ class H264Codec:
         return best
 
     def supports_level_for(self, mode: VideoMode) -> bool:
-        return h264_level_for(mode.width, mode.height, mode.fps) <= self.max_level
+        return mode_within_level(mode, self.level)
 
 
 @dataclass
@@ -357,6 +391,8 @@ class SinkCaps:
     rtcp_port: int = 0
     edid: Optional[bytes] = None
     idr_request: bool = False
+    # Parsed wfd_uibc_capability. None when the sink was not asked or did not answer.
+    uibc: Optional[object] = None
     raw: dict[str, str] = field(default_factory=dict)
 
     @property
@@ -386,6 +422,10 @@ def parse_sink_caps(body: str) -> SinkCaps:
         caps.rtp_port, caps.rtcp_port = parse_client_rtp_ports(params["wfd_client_rtp_ports"])
     caps.edid = parse_display_edid(params.get("wfd_display_edid", ""))
     caps.idr_request = params.get("wfd_idr_request_capability", "").strip() == "1"
+    if "wfd_uibc_capability" in params:
+        from .uibc import parse_uibc_capability
+
+        caps.uibc = parse_uibc_capability(params["wfd_uibc_capability"])
     return caps
 
 
@@ -395,12 +435,15 @@ def parse_sink_caps(body: str) -> SinkCaps:
 # `wfd_content_protection` is deliberately *not* asked for: we never run HDCP,
 # and a Samsung sink that is asked for it and answers HDCP2.x then expects an
 # HDCP session and shows "can't display content because it's not secure".
+# gnome-network-displays wfd_params_m3_query_params: mandatory, then the extra
+# three. It does not ask wfd_content_protection or wfd_coupled_sink.
 M3_QUERY_KEYS = (
-    "wfd_video_formats",
-    "wfd_audio_codecs",
     "wfd_client_rtp_ports",
+    "wfd_audio_codecs",
+    "wfd_video_formats",
     "wfd_display_edid",
     "wfd_idr_request_capability",
+    "microsoft_cursor",
 )
 M3_HDCP_PROBE_KEY = "wfd_content_protection"
 
@@ -417,9 +460,18 @@ STANDARD_PARAMS = frozenset({
 })
 
 
-def m3_query_keys(probe_hdcp: bool = False) -> tuple[str, ...]:
-    """Keys for the M3 GET_PARAMETER body. `probe_hdcp` adds wfd_content_protection (diagnostics only)."""
-    return M3_QUERY_KEYS + ((M3_HDCP_PROBE_KEY,) if probe_hdcp else ())
+def m3_query_keys(probe_hdcp: bool = False, touch: bool = False) -> tuple[str, ...]:
+    """Keys for the M3 GET_PARAMETER body.
+
+    `touch` appends `wfd_uibc_capability` (finger / S Pen). `probe_hdcp` stays
+    last and is diagnostics only — it is not part of a normal M3.
+    """
+    keys = M3_QUERY_KEYS
+    if touch:
+        keys = keys + ("wfd_uibc_capability",)
+    if probe_hdcp:
+        keys = keys + (M3_HDCP_PROBE_KEY,)
+    return keys
 
 
 def vendor_params(params: dict[str, str]) -> dict[str, str]:
@@ -434,15 +486,19 @@ class Negotiated:
     profile: int = H264_PROFILE_CBP
     audio: Optional[str] = None  # M4 wfd_audio_codecs descriptor
     reason: str = ""
-    # Single level bit the encoder should target so the SPS matches the mode.
-    # Samsung often advertises level 3.1 while listing 1080p; the stream still
-    # has to be a legal H.264 level for the resolution we actually send.
+    # Single level bit the encoder must write into the SPS. 0 leaves the
+    # encoder alone (the gnome-network-displays path, which never sets a level).
     stream_level: int = 0
+    latency: int = 0
+    min_slice_size: int = 0
+    frame_rate_control: int = 0
+    bitrate_kbps: int = 4096
 
     @property
-    def level_idc(self) -> int:
-        bit = self.stream_level or h264_level_for(self.mode.width, self.mode.height, self.mode.fps)
-        return LEVEL_IDC.get(bit, 40)
+    def level_idc(self) -> Optional[int]:
+        if not self.stream_level:
+            return None
+        return LEVEL_IDC.get(self.stream_level)
 
     @property
     def gst_profile(self) -> str:
@@ -460,32 +516,81 @@ class Negotiated:
         return None
 
 
-def _aspect(w: int, h: int) -> float:
-    return round(w / h, 2)
-
-
-def _real_native(caps: SinkVideoCaps) -> Optional[VideoMode]:
-    """Sink-declared native mode, ignoring the VGA placeholder.
-
-    Many sinks (the Galaxy Tab S10 FE included) put CEA index 0 (640x480p60)
-    in the native field while advertising 1080p. That placeholder is not a
-    preference. A native mode the bitmap actually lists, other than that
-    placeholder, is.
-    """
-    native = caps.native_mode
-    if native is None:
-        return None
-    if native.table == TABLE_CEA and native.index == 0:
-        return None
-    return native
-
-
 def _profile_of(codec: H264Codec, *, allow_chp: bool) -> int:
     if codec.profile & H264_PROFILE_CBP:
         return H264_PROFILE_CBP
     if allow_chp and codec.profile & H264_PROFILE_CHP:
         return H264_PROFILE_CHP
     return H264_PROFILE_CBP
+
+
+def _prefer_codec(codecs: list[H264Codec], *, allow_chp: bool) -> Optional[H264Codec]:
+    """gnome-network-displays: first codec, then one whose profile is CBP, then a higher level."""
+    chosen: Optional[H264Codec] = None
+    for item in codecs:
+        if not allow_chp and not (item.profile & H264_PROFILE_CBP):
+            continue
+        if chosen is None:
+            chosen = item
+            continue
+        item_cbp = bool(item.profile & H264_PROFILE_CBP)
+        chosen_cbp = bool(chosen.profile & H264_PROFILE_CBP)
+        if item_cbp and not chosen_cbp:
+            chosen = item
+        elif item_cbp == chosen_cbp and item.level > chosen.level:
+            chosen = item
+    return chosen
+
+
+def _pick_video(
+    caps: Optional[SinkVideoCaps],
+    want: Optional[tuple[int, int]] = None,
+    max_fps: int = 60,
+    max_pixels: int = 1920 * 1200,
+    allow_chp: bool = True,
+    gnd_compat: bool = False,
+    force_1080p30: bool = False,
+) -> tuple[VideoMode, Optional[H264Codec], str]:
+    if caps is None or not caps.codecs:
+        return FALLBACK_MODE, None, "sink sent no video caps; 1080p30 fallback"
+    codec = _prefer_codec(caps.codecs, allow_chp=allow_chp)
+    if codec is None:
+        return FALLBACK_MODE, None, "no usable H.264 profile; 1080p30 fallback"
+    if force_1080p30:
+        # The Tab S10 FE advertises only level 3.1, which excludes 1080p.
+        # gnome-network-displays still sends 1920x1080p30 and the tablet plays it.
+        return FALLBACK_MODE, codec, "forced 1920x1080p30 (--resolution 1080)"
+    if gnd_compat:
+        # wfd_client_select_codec_and_resolution compiles the native-resolution
+        # search out (#if 0) and always falls back to 1920x1080p30.
+        return FALLBACK_MODE, codec, "gnome-network-displays hardcoded 1920x1080p30"
+
+    candidates: list[tuple[VideoMode, H264Codec]] = []
+    for item in caps.codecs:
+        if not allow_chp and not (item.profile & H264_PROFILE_CBP):
+            continue
+        for mode in item.modes():
+            if mode.fps > max_fps or mode.pixels > max_pixels:
+                continue
+            if not item.supports_level_for(mode):
+                continue
+            candidates.append((mode, item))
+    if not candidates:
+        return FALLBACK_MODE, codec, "no listed mode fits the sink H.264 level; 1080p30 fallback"
+
+    def key(c: tuple[VideoMode, H264Codec]):
+        mode = c[0]
+        exact = bool(want) and (mode.width, mode.height) == (want[0], want[1])
+        inside = bool(want) and mode.width <= want[0] and mode.height <= want[1]
+        cbp = 1 if c[1].profile & H264_PROFILE_CBP else 0
+        return (exact, inside, mode.pixels, mode.fps, cbp)
+
+    mode, chosen = max(candidates, key=key)
+    if want and (mode.width, mode.height) == (want[0], want[1]):
+        reason = f"requested {want[0]}x{want[1]} within sink level 0x{chosen.level:02x}"
+    else:
+        reason = f"best mode within sink level 0x{chosen.level:02x}"
+    return mode, chosen, reason
 
 
 def select_video(
@@ -495,75 +600,41 @@ def select_video(
     max_pixels: int = 1920 * 1200,
     target_aspect: Optional[float] = None,
     allow_chp: bool = True,
+    gnd_compat: bool = False,
+    force_1080p30: bool = False,
 ) -> tuple[VideoMode, int, int, str]:
-    """Pick (mode, m4_level_byte, profile, reason) from modes the sink listed.
+    """Pick (mode, m4_level_byte, profile, reason).
 
-    The H.264 level bitmap is *not* a veto. The Tab S10 FE answers M3 with
-    level 0x01 (3.1 only) while setting the 1080p60 bit; gnome-network-displays
-    still sends 1080p and the tablet displays it. Dropping those modes leaves
-    us on 720p30, which is not the panel.
+    Default: the largest progressive mode the sink listed whose macroblock
+    rate fits the advertised H.264 level (CBP over CHP). The Tab S10 FE's
+    level byte 0x01 is only 3.1, so 720p30 is in and 720p60/1080p are not.
+    The returned level byte is the sink codec's bitmap, echoed in M4.
 
-    Preference: the source's native size (`want`) when the sink lists it,
-    then a real sink native mode (only when `want` is absent), then aspect,
-    then most pixels and fps. Profile prefers CBP (WFD mandatory); CHP only
-    when that is all the sink offered. The returned level byte is the sink
-    codec's advertised bitmap, echoed in M4 the way gnome-network-displays does.
+    `gnd_compat` is the literal gnome-network-displays choice: 1920x1080p30.
+    `target_aspect` is accepted for callers and is not a tie-break; pixel
+    count and frame rate decide.
     """
-    if caps is None or not caps.codecs:
-        return FALLBACK_MODE, h264_level_for(1920, 1080, 30), H264_PROFILE_CBP, "sink sent no video caps; 1080p30 fallback"
-
-    candidates: list[tuple[VideoMode, H264Codec]] = []
-    for codec in caps.codecs:
-        if not allow_chp and not (codec.profile & H264_PROFILE_CBP):
-            continue
-        for mode in codec.modes():
-            if mode.fps <= max_fps and mode.pixels <= max_pixels:
-                candidates.append((mode, codec))
-    if not candidates:
-        return FALLBACK_MODE, h264_level_for(1920, 1080, 30), H264_PROFILE_CBP, "no sink mode fits limits; 1080p30 fallback"
-
-    native = _real_native(caps)
-    if target_aspect is None and native and native.table != TABLE_CEA:
-        target_aspect = _aspect(native.width, native.height)
-
-    def key(c: tuple[VideoMode, H264Codec]):
-        mode = c[0]
-        exact = bool(want) and (mode.width, mode.height) == (want[0], want[1])
-        inside = bool(want) and mode.width <= want[0] and mode.height <= want[1]
-        native_hit = (not want) and native is not None and mode == native
-        aspect_ok = target_aspect is not None and abs(_aspect(mode.width, mode.height) - target_aspect) < 0.02
-        # CBP wins ties so both descriptors of the same mode don't flip to CHP.
-        cbp = 1 if c[1].profile & H264_PROFILE_CBP else 0
-        return (exact, inside, native_hit, aspect_ok, mode.pixels, mode.fps, cbp)
-
-    mode, codec = max(candidates, key=key)
-    profile = _profile_of(codec, allow_chp=allow_chp)
-    if want and (mode.width, mode.height) == (want[0], want[1]):
-        reason = f"requested {want[0]}x{want[1]} supported by sink"
-    elif (not want) and native is not None and mode == native:
-        reason = "sink native mode"
-    else:
-        reason = "best sink mode" + (f" for aspect {target_aspect}" if target_aspect else "")
-    if not codec.supports_level_for(mode):
-        reason += f"; sink level 0x{codec.level:02x} is below this mode"
-        log.info(
-            "sink lists %s but H.264 level byte 0x%02x cannot carry it; "
-            "M4 echoes that byte, the encoder targets the mode's real level",
-            mode, codec.level,
-        )
-    return mode, codec.level, profile, reason
+    del target_aspect  # kept so existing callers do not break
+    mode, codec, reason = _pick_video(
+        caps, want, max_fps, max_pixels, allow_chp, gnd_compat, force_1080p30,
+    )
+    if codec is None:
+        return mode, h264_level_for(mode.width, mode.height, mode.fps), H264_PROFILE_CBP, reason
+    return mode, codec.level, _profile_of(codec, allow_chp=allow_chp), reason
 
 
 def select_audio(sink: SinkCaps) -> Optional[str]:
-    """One audio codec the sink advertised. AAC 48 kHz stereo, else LPCM 48 kHz.
+    """AAC 48 kHz stereo when the sink lists it, else LPCM 48 kHz.
 
-    Samsung sinks treat a program with no audio elementary stream as content
-    that is "not secure" and tear it down. A silent track is enough.
+    Descriptor text matches wfd_audio_get_descriptor (`AAC %08X %02X`).
+    gnome-network-displays only selects AAC mode 0x1; LPCM is the fallback
+    for a sink that did not offer that AAC mode. A silent track is muxed
+    either way — Samsung treats a video-only MPEG-TS as not secure.
     """
     if sink.supports_aac:
-        return f"AAC {AAC_48K_2CH:08x} 00"
+        return f"AAC {AAC_48K_2CH:08X} 00"
     if sink.supports_lpcm48:
-        return f"LPCM {LPCM_48K_2CH:08x} 00"
+        return f"LPCM {LPCM_48K_2CH:08X} 00"
     return None
 
 
@@ -575,29 +646,54 @@ def negotiate(
     target_aspect: Optional[float] = None,
     audio: bool = True,
     encoder: str = "auto",
+    gnd_compat: bool = False,
+    force_1080p30: bool = False,
 ) -> Negotiated:
-    if target_aspect is None and sink.edid:
-        from ..display.edid import parse_edid
-
-        info = parse_edid(sink.edid)
-        if info and info.preferred:
-            target_aspect = _aspect(info.preferred[0], info.preferred[1])
+    del target_aspect
     allow_chp = encoder != "openh264enc"
-    mode, level, profile, reason = select_video(
-        sink.video, want, max_fps, max_pixels, target_aspect, allow_chp=allow_chp,
+    mode, codec, reason = _pick_video(
+        sink.video, want, max_fps, max_pixels, allow_chp=allow_chp, gnd_compat=gnd_compat,
+        force_1080p30=force_1080p30,
     )
+    if codec is None:
+        level, profile = h264_level_for(mode.width, mode.height, mode.fps), H264_PROFILE_CBP
+        latency = min_slice = frame_rate = 0
+    else:
+        level, profile = codec.level, _profile_of(codec, allow_chp=allow_chp)
+        latency, min_slice, frame_rate = codec.latency, codec.min_slice_size, codec.frame_rate_control
+    # The literal GND path never writes an SPS level. Otherwise the SPS level
+    # is exactly the one bit this mode needs (3.1 for 720p30, 4.0 for 1080p30).
+    # `--resolution 1080` forces that mode and still writes level 4.0, even
+    # when the sink's level byte is only 3.1. M4 keeps echoing the sink byte.
+    if gnd_compat and not force_1080p30:
+        stream_level = 0
+    else:
+        stream_level = h264_level_for(mode.width, mode.height, mode.fps)
     audio_desc = select_audio(sink) if audio else None
     return Negotiated(
         mode=mode, level=level, profile=profile, audio=audio_desc, reason=reason,
-        stream_level=h264_level_for(mode.width, mode.height, mode.fps),
+        stream_level=stream_level, latency=latency, min_slice_size=min_slice,
+        frame_rate_control=frame_rate, bitrate_kbps=gnd_bitrate_kbps(level, profile),
     )
 
 
-def m4_video_descriptor(mode: VideoMode, level: int, profile: int = H264_PROFILE_CBP) -> str:
-    """Single-mode `wfd_video_formats` value for M4 (exactly one bit set)."""
+def m4_video_descriptor(
+    mode: VideoMode,
+    level: int,
+    profile: int = H264_PROFILE_CBP,
+    latency: int = 0,
+    min_slice_size: int = 0,
+    frame_rate_control: int = 0,
+) -> str:
+    """Single-mode `wfd_video_formats` value, same layout as gnome-network-displays.
+
+    Profile, level and bitmaps are uppercase; the frame-rate-control byte is
+    the sink's skipping bit (`%02x` in wfd_video_codec_get_descriptor_for_resolution).
+    Slice-encoding params are forced to 0, as that function does.
+    """
     bits = {TABLE_CEA: 0, TABLE_VESA: 0, TABLE_HH: 0}
     bits[mode.table] = 1 << mode.index
     return (
-        f"00 00 {profile:02x} {level:02x} {bits[TABLE_CEA]:08x} {bits[TABLE_VESA]:08x} "
-        f"{bits[TABLE_HH]:08x} 00 0000 0000 00 none none"
+        f"00 00 {profile:02X} {level:02X} {bits[TABLE_CEA]:08X} {bits[TABLE_VESA]:08X} "
+        f"{bits[TABLE_HH]:08X} {latency:02X} {min_slice_size:04X} 0000 {frame_rate_control & 0x1:02x} none none"
     )

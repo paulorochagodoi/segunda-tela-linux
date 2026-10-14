@@ -53,7 +53,7 @@ class VirtualDisplay:
                 pass_fds=(self.portal.fd,),
             )
         if self.backend == "evdi-grab" and self.evdi is not None:
-            from .evdi import EvdiFrameFeeder
+            from .evdi import EVDI_RAW_FORMAT, EvdiAppsrcPusher, EvdiFrameFeeder
 
             mon = self.evdi
             deadline = time.monotonic() + 5
@@ -63,16 +63,24 @@ class VirtualDisplay:
                 log.warning("compositor has not enabled the EVDI output yet; streaming test pattern")
                 return pattern_source(self.width, self.height, self.fps)
             w, h, _r = mon.mode
+            nbytes = w * h * 4
+            pusher = EvdiAppsrcPusher(mon, w, h, self.fps)
             feeder = EvdiFrameFeeder(mon, w, h, self.fps)
             return CaptureSource(
                 gst=(
-                    f"fdsrc fd=0 blocksize={w * h * 4} do-timestamp=true ! "
-                    f"rawvideoparse use-sink-caps=false width={w} height={h} format=bgrx "
+                    f"appsrc name=evdi-src is-live=true format=time do-timestamp=false block=true "
+                    f"max-bytes={nbytes * 2} "
+                    f'caps="video/x-raw,format=RGBx,width={w},height={h},framerate={self.fps}/1"'
+                ),
+                pipe_gst=(
+                    f"fdsrc fd=0 blocksize={nbytes} do-timestamp=true ! "
+                    f"rawvideoparse use-sink-caps=false width={w} height={h} format={EVDI_RAW_FORMAT} "
                     f"framerate={self.fps}/1"
                 ),
                 backend="evdi-grab",
                 stdin_feeder=feeder,
-                feeder_stop=feeder.stop,
+                feeder_stop=lambda: (pusher.stop(), feeder.stop()),
+                appsrc_pusher=pusher,
             )
         if self.backend == "x11":
             return CaptureSource(
@@ -117,9 +125,15 @@ def resolve_capture(mode: str, capture: str, wayland: bool, x11: bool) -> str:
     return "test"
 
 
-def evdi_modes(width: int, height: int, fps: int) -> list[tuple[int, int, int]]:
-    """EDID mode list: requested/negotiated mode first, then tablet-ish modes."""
+def evdi_modes(width: int, height: int, fps: int, locked: bool = False) -> list[tuple[int, int, int]]:
+    """EDID mode list: requested mode first, then tablet-ish modes.
+
+    `locked` advertises only the requested mode (`--resolution 1080` is
+    1920x1080 and must not also offer 1920x1200, or the compositor may pick it).
+    """
     modes = [(width, height, 60 if fps >= 50 else fps)]
+    if locked:
+        return modes
     for m in ((1920, 1200, 60), (2560, 1600, 60), (1920, 1080, 60)):
         if m not in modes:
             modes.append(m)
@@ -139,6 +153,7 @@ def create_virtual_display(
     fps: int = 30,
     capture: str = "auto",
     portal_restore: bool = True,
+    lock_mode: bool = False,
 ) -> VirtualDisplay:
     wayland, x11 = _wayland(), _x11()
     backend = resolve_capture(mode, capture, wayland, x11)
@@ -152,7 +167,7 @@ def create_virtual_display(
         from .edid import build_edid
         from .evdi import EvdiError, EvdiMonitor
 
-        modes = evdi_modes(width, height, fps)
+        modes = evdi_modes(width, height, fps, locked=lock_mode)
         try:
             mon = EvdiMonitor(build_edid(modes), area_limit=max(w * h for w, h, _ in modes),
                               grab=(backend == "evdi"), fps=fps)

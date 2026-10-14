@@ -1,0 +1,18 @@
+# Segunda Tela — virtual touchscreen for WFD UIBC (finger and S Pen).
+# Installed by scripts/setup-evdi.sh. Log out and back in afterwards so
+# logind applies the seat ACL on /dev/uinput.
+#
+# The device reports pixels of the EVDI output. ID_INPUT_TOUCHSCREEN makes
+# libinput treat it as a touchscreen (not a touchpad). The identity
+# calibration leaves those pixels unchanged. COSMIC binds the device to the
+# EVDI connector via ~/.config/cosmic/com.system76.CosmicComp/v1/input_devices
+# (map_to_output), so contacts land on 'Segunda Tela' only.
+
+KERNEL=="uinput", SUBSYSTEM=="misc", TAG+="uaccess", MODE="0660"
+
+SUBSYSTEM=="input", KERNEL=="event*", ATTR{name}=="Segunda Tela Touch", \
+    ENV{ID_INPUT}="1", ENV{ID_INPUT_TOUCHSCREEN}="1", \
+    ENV{LIBINPUT_CALIBRATION_MATRIX}="1 0 0 0 1 0", TAG+="seat"
+SUBSYSTEM=="input", ATTRS{name}=="Segunda Tela Touch", \
+    ENV{ID_INPUT}="1", ENV{ID_INPUT_TOUCHSCREEN}="1", \
+    ENV{LIBINPUT_CALIBRATION_MATRIX}="1 0 0 0 1 0", TAG+="seat"

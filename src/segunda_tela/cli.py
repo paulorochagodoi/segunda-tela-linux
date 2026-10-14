@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
+import select
 import signal
 import sys
-import time
 
 from . import __app_name__, __version__
 from .util.logging import setup_logging
@@ -41,6 +42,15 @@ def build_parser() -> argparse.ArgumentParser:
                       help="Diagnostics: also query wfd_content_protection in M3 (HDCP is still never selected; "
                            "some Samsung sinks then refuse with 'not secure')")
     p.set_defaults(probe_hdcp=False)
+    p.add_argument(
+        "--resolution",
+        choices=("1080",),
+        default=None,
+        help="Force the stream and the EVDI monitor to 1920x1080p30 with H.264 level 4.0. "
+             "gnome-network-displays sends 1080p30 to the Tab S10 FE and the tablet plays it. "
+             "Without this flag the mode stays inside the sink's advertised level (720p30 when "
+             "that level is only 3.1).",
+    )
     p.add_argument("--width", type=int, default=None, help="Stream/monitor width (default: negotiate, monitor 1920)")
     p.add_argument("--height", type=int, default=None, help="Stream/monitor height (default: negotiate, monitor 1200)")
     p.add_argument("--fps", type=int, default=None, help="Max fps (default 60 with VAAPI, 30 with x264)")
@@ -69,6 +79,21 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Send desktop audio. A silent AAC/LPCM track is already negotiated when the sink offers one "
         "(Samsung treats a video-only MPEG-TS as not secure)",
+    )
+    p.add_argument(
+        "--no-touch",
+        action="store_true",
+        help="Do not negotiate WFD UIBC or inject finger/S Pen events. "
+             "By default the source asks wfd_uibc_capability, listens for generic and HIDC "
+             "multitouch (and Samsung TCP 50000), and injects contacts on the EVDI output only.",
+    )
+    p.add_argument(
+        "--gnd-compat",
+        action="store_true",
+        help="Literal gnome-network-displays resolution: always 1920x1080p30, and do not force the "
+             "SPS level. Without this flag the RTSP messages and encoder graph already match that "
+             "project, but the mode is the best one inside the sink's H.264 level (720p30 on the "
+             "Tab S10 FE, whose level byte 0x01 is only 3.1) and the SPS level matches that mode.",
     )
     p.add_argument("--port", type=int, default=7236, help="WFD RTSP port (default 7236)")
     p.add_argument("--bind", default="0.0.0.0")
@@ -159,6 +184,9 @@ def cmd_doctor(_args) -> int:
     except ev.EvdiError:
         line(False, "libevdi", "sudo ./scripts/setup-evdi.sh")
     line(bool(ev.evdi_cards()), "evdi DRM device", ev.device_node_hint())
+    uinput = os.access("/dev/uinput", os.W_OK)
+    print(f"[{'ok' if uinput else '..'}] /dev/uinput"
+          + ("" if uinput else " — sudo ./scripts/setup-evdi.sh (then log out and back in) for touch"))
     session = os.environ.get("XDG_SESSION_TYPE", "?")
     desktop = os.environ.get("XDG_CURRENT_DESKTOP", "?")
     print(f"[..] session={session} desktop={desktop}")
@@ -274,11 +302,22 @@ def main(argv: list[str] | None = None) -> int:
         encoder=args.encoder,
         audio=args.audio,
         probe_hdcp=args.probe_hdcp,
+        gnd_compat=args.gnd_compat,
+        force_1080p30=args.resolution == "1080",
+        touch=not args.no_touch,
     )
 
+    # Wake the main thread with a byte. Stopping GStreamer inside this
+    # handler is what left gst_poll_set_flushing and a KeyboardInterrupt
+    # traceback in the log.
+    wake_r, wake_w = os.pipe()
+    os.set_blocking(wake_w, False)
+
     def _stop(*_a):
-        session.stop()
-        sys.exit(0)
+        try:
+            os.write(wake_w, b"\0")
+        except OSError:
+            pass
 
     signal.signal(signal.SIGINT, _stop)
     signal.signal(signal.SIGTERM, _stop)
@@ -321,8 +360,17 @@ def main(argv: list[str] | None = None) -> int:
         flush=True,
     )
     print("Unofficial project — not affiliated with Samsung. Ctrl+C to stop.", flush=True)
-    while True:
-        time.sleep(3600)
+    try:
+        while True:
+            ready, _, _ = select.select([wake_r], [], [], 3600)
+            if ready:
+                break
+    finally:
+        signal.signal(signal.SIGINT, signal.SIG_DFL)
+        signal.signal(signal.SIGTERM, signal.SIG_DFL)
+        session.stop()
+        os.close(wake_r)
+        os.close(wake_w)
 
 
 if __name__ == "__main__":

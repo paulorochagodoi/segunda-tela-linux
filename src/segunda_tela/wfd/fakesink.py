@@ -93,6 +93,7 @@ def run_fake_sink(
     vendor: dict[str, str] | None = None,
     wait_keepalive: bool = False,
     idr_request: bool = False,
+    uibc_capability: Optional[str] = None,
     sink_keepalive: bool = False,
     timeout: float = 5.0,
     sock: Optional[socket.socket] = None,
@@ -118,6 +119,8 @@ def run_fake_sink(
             "wfd_content_protection": content_protection,
             "wfd_idr_request_capability": "1",
         }
+        if uibc_capability is not None:
+            answers["wfd_uibc_capability"] = uibc_capability
         keys = [k.strip() for k in res.m3.body.splitlines() if k.strip()]
         body = "".join(f"{k}: {answers[k]}\r\n" for k in keys if k in answers)
         body += "".join(f"{k}: {v}\r\n" for k, v in (vendor or {}).items())

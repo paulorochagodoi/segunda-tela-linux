@@ -103,6 +103,8 @@ def test_cli_flags_parse():
 
     p = build_parser()
     assert p.parse_args([]).probe_hdcp is False
+    assert p.parse_args([]).resolution is None
+    assert p.parse_args(["--resolution", "1080"]).resolution == "1080"
     assert p.parse_args(["--no-hdcp"]).probe_hdcp is False
     a = p.parse_args(["--probe-hdcp", "--dump-rtsp", "--log-file", "/tmp/x.log"])
     assert a.probe_hdcp and a.dump_rtsp and a.log_file == "/tmp/x.log"

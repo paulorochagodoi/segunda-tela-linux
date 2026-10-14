@@ -223,11 +223,24 @@ seguro", then TEARDOWN about 9 s after PLAY. M1–M7 completed. Two media bugs:
   `gst_mini_object_unref: assertion 'mini_object != NULL' failed` in
   `gst_rtp_session_send_rtp` when the send pad is missing.
 
-The stream now matches gnome-network-displays: MPEG-TS (`alignment=7`, PAT/PMT
-every 100 ms, PCR every 40 ms) over `rtpmp2tpay pt=33` to port 19000, no
-`rtpbin`, H.264 constrained-baseline (or high if that is the only codec that
-lists the mode) with `h264parse config-interval=-1`, constant frame rate, and
-a silent AAC track unless `--audio` is set. M4 echoes a resolution bit the
-sink listed (native/display size when present; on this S10 bitmap, 1920×1080p60)
-and `wfd_audio_codecs: AAC 00000001 00`. `wfd_idr_request` and an empty
-GET_PARAMETER keepalive are answered with 200.
+The stream now matches gnome-network-displays: MPEG-TS (`alignment=7`) over
+`rtpmp2tpay pt=33` to port 19000, no `rtpbin`, H.264 with
+`h264parse config-interval=-1`, and a silent AAC track unless `--audio` is set.
+
+## Tab S10 FE retest of f272a49 (20:12)
+
+M4 still chose 1920×1080p60 while logging that level byte 0x01 cannot carry
+it. 0x01 is H.264 level 3.1 only (108000 MB/s): 1280×720p30 fits, 720p60
+needs 3.2, 1080p needs 4.x. The encoder was also free to write a 4.2 SPS.
+The next build stays inside that level (720p30 CBP, SPS level 3.1, bitrate
+4096 kbit/s). `--gnd-compat` is the literal gnome-network-displays resolution,
+which hardcodes 1920×1080p30.
+
+The same log still has `gst_mini_object_unref` ~0.4 s after `gst_run` starts,
+with no `rtpbin`. The pipeline string contains `pipewiresrc … keepalive-time=16`.
+PipeWire's gstpipewiresrc unrefs a NULL `last_buffer` on the first frame when
+`keepalive-time > 0` (fixed upstream in commit 6c25924, not in the distro
+plugin). The media pipeline strips that property. `videorate` is `drop-only`
+without `skip-to-first`. Force-key-unit waits until the pipeline has left
+preroll. M3 key order, the presentation URL (`rtsp://ip:port/wfd1.0/streamid=0`)
+and the encoder element properties follow gnome-network-displays.

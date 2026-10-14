@@ -132,10 +132,10 @@ O fluxo de mídia é que falhava: o M4 não negociava áudio (a Samsung trata
 MPEG-TS só de vídeo como conteúdo inseguro) e o SETUP `19000-19001` metia
 `rtpbin` mesmo com RTCP 0 no M3, o que gerava
 `gst_mini_object_unref: assertion 'mini_object != NULL' failed`. O fluxo
-agora é o do gnome-network-displays: MPEG-TS em RTP payload 33 para a porta
-19000, H.264 no modo que o sink anunciou (no S10, 1920×1080p60), SPS/PPS
-antes de cada IDR, e uma faixa AAC silenciosa (`--audio` troca o silêncio
-pelo som do ambiente). Não há `rtpbin`.
+agora segue o gnome-network-displays (MPEG-TS em RTP payload 33, porta
+19000, sem `rtpbin`, AAC silenciosa). No Tab S10 FE o nível anunciado é só
+3.1, então o modo é 1280×720p30 com SPS nível 3.1. `--gnd-compat` manda o
+1080p30 fixo desse projeto.
 
 O aviso `dnsmasq … CAP_CHOWN` no journal vem do dnsmasq que o NetworkManager
 sobe para o grupo P2P (DHCP do tablet). Ele é inofensivo: o tablet recebe o IP
@@ -222,10 +222,10 @@ M1–M7: the MPEG-TS had no audio (Samsung often rejects a video-only stream as
 not secure) and SETUP `client_port=19000-19001` forced `rtpbin` even though
 M3 reported RTCP port 0, which logged
 `gst_mini_object_unref: assertion 'mini_object != NULL' failed` and ended in
-TEARDOWN. The stream is now MPEG-TS over RTP payload type 33 to port 19000,
-H.264 in a mode the sink advertised (1080p60 on that tablet), SPS/PPS before
-every IDR, and a silent AAC track (`--audio` sends the desktop instead).
-There is no `rtpbin`.
+TEARDOWN. The stream follows gnome-network-displays (MPEG-TS over RTP payload 33, port
+19000, no `rtpbin`, silent AAC). On the Tab S10 FE the advertised level is
+only 3.1, so the mode is 1280×720p30 with SPS level 3.1. `--gnd-compat`
+sends that project's hardcoded 1080p30 instead.
 
 Every run writes a rotating debug log,
 `~/.local/state/segunda-tela/segunda-tela.log`, with the verbatim RTSP

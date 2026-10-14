@@ -24,8 +24,19 @@ def test_wfd_flow_default_tablet():
         res = run_fake_sink("127.0.0.1", 17301)
     finally:
         srv.stop()
-    m3_keys = res.m3.body.split()
-    assert {"wfd_video_formats", "wfd_audio_codecs", "wfd_client_rtp_ports"} <= set(m3_keys)
+    m3_keys = [line.strip() for line in res.m3.body.splitlines() if line.strip()]
+    assert m3_keys == [
+        "wfd_client_rtp_ports",
+        "wfd_audio_codecs",
+        "wfd_video_formats",
+        "wfd_display_edid",
+        "wfd_idr_request_capability",
+        "microsoft_cursor",
+    ]
+    assert "wfd_content_protection" not in m3_keys
+    assert "wfd_coupled_sink" not in m3_keys
+    assert res.m4_params["wfd_presentation_url"].startswith("rtsp://127.0.0.1:")
+    assert res.m4_params["wfd_presentation_url"].endswith("/wfd1.0/streamid=0 none")
     assert res.m4_params["wfd_audio_codecs"] == "AAC 00000001 00"
     assert res.setup_reply.headers["transport"].startswith("RTP/AVP/UDP;unicast;client_port=19000")
     assert ";timeout=30" in res.setup_reply.headers["session"]
@@ -69,7 +80,7 @@ S10_VIDEO = (
 S10_AUDIO = "LPCM 00000002 00, AAC 00000001 00"
 
 
-def test_galaxy_tab_s10_m4_picks_1080p_and_aac():
+def test_galaxy_tab_s10_m4_picks_720p30_and_aac():
     idrs = []
     srv, ev = _server(17306, width=1920, height=1200, on_idr_request=lambda st: idrs.append(st.remote))
     try:
@@ -81,19 +92,36 @@ def test_galaxy_tab_s10_m4_picks_1080p_and_aac():
     finally:
         srv.stop()
     fields = res.m4_params["wfd_video_formats"].split()
-    # CBP, echoed level 0x01, CEA bit 8 = 1920x1080p60 (closest to 1920x1200).
+    # CBP, echoed level 0x01, CEA bit 5 = 1280x720p30. 720p60 needs level 3.2.
     assert fields[2] == "01" and fields[3] == "01"
-    assert fields[4] == "00000100" and fields[5] == "00000000"
+    assert fields[4] == "00000020" and fields[5] == "00000000"
+    assert fields[-3] == "01"  # sink frame-rate-control 0x0f, skipping bit
     assert res.m4_params["wfd_audio_codecs"] == "AAC 00000001 00"
     assert "wfd_content_protection" not in res.m4.body
     mode, rtp, rtcp = ev["play"][0]
-    assert (mode.width, mode.height, mode.fps, rtp, rtcp) == (1920, 1080, 60, 19000, 0)
+    negotiated = ev["negotiated"][0]
+    assert (mode.width, mode.height, mode.fps, rtp, rtcp) == (1280, 720, 30, 19000, 0)
+    assert negotiated.level_idc == 31
+    assert negotiated.bitrate_kbps == 4096
     assert res.idr_reply is not None and res.idr_reply.status == 200
     assert res.idr_reply.headers.get("session")
     assert idrs == ["127.0.0.1"]
     assert res.sink_keepalive_reply is not None and res.sink_keepalive_reply.status == 200
     assert res.sink_keepalive_reply.body.strip() == ""
     assert res.sink_keepalive_reply.headers.get("session")
+
+
+def test_gnd_compat_hardcodes_1080p30():
+    srv, ev = _server(17309, width=1920, height=1200, gnd_compat=True)
+    try:
+        res = run_fake_sink("127.0.0.1", 17309, video_formats=S10_VIDEO, audio_codecs=S10_AUDIO)
+    finally:
+        srv.stop()
+    fields = res.m4_params["wfd_video_formats"].split()
+    assert fields[4] == "00000080"  # CEA bit 7 = 1920x1080p30
+    mode, _rtp, _rtcp = ev["play"][0]
+    assert (mode.width, mode.height, mode.fps) == (1920, 1080, 30)
+    assert ev["negotiated"][0].level_idc is None
 
 
 def test_bare_idr_request_line_is_answered():

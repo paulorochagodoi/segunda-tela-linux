@@ -33,6 +33,9 @@ class SecondScreenSession:
         encoder: str = "auto",
         audio: bool = False,
         probe_hdcp: bool = False,
+        gnd_compat: bool = False,
+        force_1080p30: bool = False,
+        touch: bool = True,
     ) -> None:
         self.want_size = (width, height) if width and height else None
         self.mode = mode
@@ -46,6 +49,16 @@ class SecondScreenSession:
         self.fps = fps or (60 if self.encoder in HW_ENCODERS else 30)
         self.audio = audio
         self.probe_hdcp = probe_hdcp
+        self.gnd_compat = gnd_compat
+        self.force_1080p30 = force_1080p30
+        self.touch = touch
+        self.uibc = None
+        self.injector = None
+        self._touch_stop = threading.Event()
+        self._touch_wait_logged = False
+        self._touch_mapped = False
+        if force_1080p30:
+            self.want_size = (1920, 1080)
         self.display: Optional[VirtualDisplay] = None
         self.server: Optional[WfdRtspServer] = None
         self.pipeline: Optional[StreamPipeline] = None
@@ -107,7 +120,12 @@ class SecondScreenSession:
             log.info("USB link %s: display mode=%s (same EVDI/portal path as Wi-Fi)", self.usb_link.transport, self.mode)
 
         vw, vh = self.want_size or DEFAULT_VIRTUAL_SIZE
-        self.display = create_virtual_display(vw, vh, self.mode, self.fps, capture=self.capture)
+        # --resolution 1080 locks the EVDI EDID at 1920x1080p30 so the
+        # compositor does not pick 1920x1200 and does not composite at 60 Hz.
+        display_fps = 30 if self.force_1080p30 else self.fps
+        self.display = create_virtual_display(
+            vw, vh, self.mode, display_fps, capture=self.capture, lock_mode=self.force_1080p30,
+        )
         for note in self.display.notes:
             log.warning("%s", note)
         log.info(
@@ -119,6 +137,7 @@ class SecondScreenSession:
 
     def start_server(self) -> None:
         vw, vh = self.want_size or DEFAULT_VIRTUAL_SIZE
+        uibc_port = self._start_uibc()
         self.server = WfdRtspServer(
             host=self.bind_host,
             port=self.rtsp_port,
@@ -136,20 +155,123 @@ class SecondScreenSession:
             audio=True,
             encoder=self.encoder,
             probe_hdcp=self.probe_hdcp,
+            gnd_compat=self.gnd_compat,
+            force_1080p30=self.force_1080p30,
+            touch=self.touch and bool(uibc_port),
+            uibc_port=uibc_port,
+            uibc=self.uibc,
         )
         self.server.start_background()
+        # Open the virtual touchscreen only after COSMIC is told which output
+        # it belongs to. An unmapped touchscreen is delivered to the built-in
+        # panel, which is the opposite of 'Segunda Tela' only.
+        if self.touch and self.injector is not None and not self._arm_touch():
+            threading.Thread(target=self._touch_map_loop, name="touch-map", daemon=True).start()
+
+    def _start_uibc(self) -> int:
+        if not self.touch:
+            log.info("touch: off (--no-touch)")
+            return 0
+        from .display.touch import TouchInjector
+        from .wfd.uibc import UibcServer
+
+        self.injector = TouchInjector()
+        self.uibc = UibcServer(self._on_touch)
+        port = self.uibc.start()
+        if not port:
+            log.warning("touch: UIBC listener did not start")
+        return port
+
+    def _on_touch(self, event) -> None:
+        if self.injector is not None:
+            self.injector.handle(event)
+
+    def _ensure_touch_device(self) -> None:
+        if self.injector is None:
+            return
+        width = height = 0
+        evdi = self.display.evdi if self.display is not None else None
+        mode = getattr(evdi, "mode", None)
+        if mode:
+            width, height = int(mode[0]), int(mode[1])
+        elif self.display is not None:
+            width, height = self.display.width, self.display.height
+        if width and height:
+            self.injector.configure(width, height)
+
+    def _map_touch(self) -> bool:
+        """Bind the virtual touchscreen to the EVDI connector in COSMIC."""
+        if not self.touch or self.injector is None or self.display is None:
+            return False
+        from .display.randr import evdi_connector_names, evdi_status, query_layout
+        from .display.touch import DEVICE_NAME, write_cosmic_touch_map
+
+        try:
+            status = evdi_status(query_layout(), evdi_connector_names())
+        except Exception as exc:  # noqa: BLE001
+            log.info("touch: layout unavailable (%s)", exc)
+            return False
+        output = status.output
+        if output is None:
+            if not self._touch_wait_logged:
+                log.info("touch: waiting for the EVDI output before mapping '%s'", DEVICE_NAME)
+                self._touch_wait_logged = True
+            return False
+        try:
+            path = write_cosmic_touch_map(output.name)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("touch: could not write the COSMIC map (%s). Device name is '%s'.", exc, DEVICE_NAME)
+            return False
+        if not self._touch_mapped:
+            log.info(
+                "touch: '%s' mapped to %s (%s). Coordinates are this output's pixels; "
+                "udev calibration is the identity matrix.",
+                DEVICE_NAME, output.name, path,
+            )
+            self._touch_mapped = True
+        if output.width and output.height:
+            self.injector.configure(output.width, output.height)
+        else:
+            self._ensure_touch_device()
+        return bool(self.injector.open)
+
+    def _arm_touch(self) -> bool:
+        """Write the COSMIC output map, then create the uinput device."""
+        return self._map_touch()
+
+    def _touch_map_loop(self) -> None:
+        for _ in range(15):
+            if self._touch_stop.is_set():
+                return
+            if self._arm_touch():
+                return
+            self._touch_stop.wait(2)
 
     def _on_play(self, state: SessionState) -> None:
         self.last_state = state
         mode = state.mode
+        negotiated = state.negotiated
         if self.usb_link and self.usb_link.transport.startswith("adb"):
             log.info("PLAY via adb — RTP/UDP may need USB tethering (adb reverse only carries TCP)")
         assert self.display is not None
-        bitrate = self.bitrate_kbps or default_bitrate_kbps(mode.width, mode.height, mode.fps)
+        # 720p60 is above H.264 level 3.1. Grab and parse at the negotiated
+        # rate (720p30 on the Tab S10 FE) instead of the EDID's 60 Hz.
+        self.display.fps = mode.fps
+        evdi = self.display.evdi
+        if evdi is not None and hasattr(evdi, "fps"):
+            evdi.fps = max(1, int(mode.fps))
+        if self.injector is not None:
+            self.injector.set_stream(mode.width, mode.height)
+            if not self.injector.open:
+                self._arm_touch()
+            else:
+                self._ensure_touch_device()
+        bitrate = self.bitrate_kbps or (
+            negotiated.bitrate_kbps if negotiated else default_bitrate_kbps(mode.width, mode.height, mode.fps)
+        )
         with self._plock:
             if self.pipeline:
                 self.pipeline.stop()
-            negotiated = state.negotiated
             self.pipeline = StreamPipeline(
                 capture_source=self.display.new_capture(),
                 dest_host=state.rtp_host,
@@ -189,6 +311,13 @@ class SecondScreenSession:
                 self.pipeline = None
 
     def stop(self) -> None:
+        self._touch_stop.set()
+        if self.uibc is not None:
+            self.uibc.stop()
+            self.uibc = None
+        if self.injector is not None:
+            self.injector.close()
+            self.injector = None
         if self.usb_initiator is not None:
             self.usb_initiator.stop()
             self.usb_initiator = None
