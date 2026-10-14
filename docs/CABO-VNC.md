@@ -74,8 +74,13 @@ O que o comando faz, nesta ordem:
 4. Cria um touchscreen uinput ("Segunda Tela VNC") do tamanho dessa saída e
    grava o mapa do COSMIC para que o toque fique **só** nela
    (`~/.config/cosmic/com.system76.CosmicComp/v1/input_devices`).
-5. Se o adb está autorizado, abre o bVNC com
-   `am start -a android.intent.action.VIEW -p com.iiordanov.freebVNC -d vnc://127.0.0.1:5900?VncPassword=…`.
+5. Se o adb está autorizado e `pm list packages` mostra
+   `com.iiordanov.freebVNC`, abre o bVNC **pelo componente**
+   `com.iiordanov.freebVNC/com.iiordanov.bVNC.RemoteCanvasActivity`
+   (`am start -n … -d vnc://127.0.0.1:5900?VncPassword=…`).
+   Um `vnc://` sem componente no One UI abriu o histórico de alertas de
+   emergência. Se esse componente recusar o URI, o comando ainda faz
+   `monkey -p com.iiordanov.freebVNC` e imprime endereço, porta e senha.
 
 Arraste uma janela para a direita do eDP-1: ela aparece no tablet. O dedo no
 bVNC toca essa tela, não o painel interno.
@@ -119,10 +124,16 @@ A seção `-- USB --` continua valendo para o adb (autorização, cabo Samsung).
   testes cobrem o RFB (senha, Tight, ZRLE, dano), o túnel decidido em código
   e o relatório do toque. O EVDI, o cosmic-randr e o adb reais ficam na máquina
   do Paulo.
-- Tela cheia a 30 fps o tempo todo não é o alvo: o empacotamento RGBx→BGR do
-  modo 24-bit do bVNC é em Python. Atualização por dano (janela, cursor do
-  compositor já misturado no frame) é que cabe em 30 fps. A primeira imagem
-  pode levar uma fração de segundo.
+- O grab do EVDI é RGBx (fourcc AB24). O bVNC pede shifts 16,8,0. Raw e ZRLE
+  seguem isso (byte 0 = azul). O Tight do bVNC **não**: `Decoder.handleTightRect`
+  pinta o byte 0 como vermelho. O servidor manda R,G,B no Tight por causa disso.
+- O cursor do compositor não entra no grab do EVDI. O VNC desenha uma seta na
+  posição do dedo. O toque em si vai para o uinput mapeado em `DVI-I-1`.
+- Um pedido incremental sem pixels novos fica pendente até chegar dano. Uma
+  resposta vazia faz o bVNC esperar o timer dele e a imagem parece parada.
+- Empacotar 1920×1200 em Python puro levava segundos (o log do Tab mostrou
+  ~0,2 fps e vários MB por quadro). Com numpy o Tight de um quadro inteiro
+  cabe numa fração de segundo; janela de dano continua o caminho rápido.
 - O `map_to_output` do cosmic-comp vale para touchscreen. Versões recentes
   releem `input_devices` sozinhas; se o toque cair no eDP-1, saia e entre na
   sessão ou confira o nome da saída com `cosmic-randr list` (algo como
@@ -145,9 +156,13 @@ only that framebuffer over RFB (Tight and ZRLE, damage rectangles, classic VNC
 password). Transport is `adb reverse tcp:5900 tcp:5900` bound to `127.0.0.1`;
 USB tethering is the fallback and then the server also binds the PC's tether
 address. Touch is a uinput touchscreen mapped to that output via COSMIC's
-`input_devices` file. With adb authorized, bVNC Free
-(`com.iiordanov.freebVNC`) is started on `vnc://127.0.0.1:5900`.
+`input_devices` file. With adb authorized, bVNC Free is started with
+`am start -n com.iiordanov.freebVNC/com.iiordanov.bVNC.RemoteCanvasActivity`
+and `vnc://127.0.0.1:5900`.
 
 wayvnc is not used: noble's 0.7.2 speaks only `wlr-screencopy`, which
-cosmic-comp does not implement. See the Portuguese sections above for the
-procedure and the limits (this path is not run on hardware in CI).
+cosmic-comp does not implement. bVNC is started with `am start -n` on
+`com.iiordanov.freebVNC/com.iiordanov.bVNC.RemoteCanvasActivity` (a bare
+`vnc://` VIEW intent opened Emergency alerts on One UI). Tight bytes are
+R,G,B because bVNC's Tight decoder paints byte 0 as red; Raw and ZRLE follow
+the C24bit shifts. See the Portuguese sections for the procedure.

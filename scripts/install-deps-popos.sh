@@ -13,7 +13,8 @@ apt-get install -y \
   pipewire pipewire-pulse wireplumber \
   xdg-desktop-portal \
   network-manager wpasupplicant \
-  android-tools-adb
+  android-tools-adb \
+  python3-numpy
 
 # Encoder H.264 por hardware (AMD/Intel): `vah264enc` vem do plugins-bad (plugin va);
 # `vaapih264enc` do gstreamer1.0-vaapi (legado). mesa-va-drivers = VA-API do amdgpu.

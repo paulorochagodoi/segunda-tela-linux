@@ -43,6 +43,7 @@ class UsbVncSession:
         self._touch: Optional[EvdiTouch] = None
         self._pump: Optional[threading.Thread] = None
         self._stop = threading.Event()
+        self._bvnc_auto = False
 
     def start(self) -> None:
         assessment = assess_wayvnc(detect_wayvnc_text(), detect_protocols())
@@ -84,6 +85,16 @@ class UsbVncSession:
         except UinputError as exc:
             self.notes.append(f"Toque indisponível: {exc}")
             self._touch = None
+        else:
+            # Write the map again once the device exists. cosmic-comp matches
+            # the uinput name; a file written before the node appears is easy
+            # to miss until the next login.
+            if output_name:
+                try:
+                    path = install_touch_map(output_name)
+                    self.notes.append(f"Toque do uinput confirmado em {output_name} ({path}).")
+                except OSError as exc:
+                    self.notes.append(f"Não gravei o map_to_output do COSMIC: {exc}")
         self._server = VncServer(
             password=self.password,
             width=width,
@@ -108,7 +119,8 @@ class UsbVncSession:
             ok, detail = launch_bvnc(
                 self._transport._adb, self._transport.client_host, self._server.port, self.password,
             )
-            self.notes.append("bVNC: " + (detail if ok else f"não abriu ({detail})"))
+            self._bvnc_auto = ok
+            self.notes.extend(line for line in detail.splitlines() if line.strip())
 
     def banner_lines(self) -> list[str]:
         """User-visible lines. The password is only here, never in the log."""
@@ -116,10 +128,11 @@ class UsbVncSession:
             return list(self.notes)
         lines = list(self.notes)
         lines.append(f"Senha VNC: {self.password}")
-        lines.append(
-            f"No tablet: bVNC → {self._transport.client_host}:{self._server.port} "
-            "(o app abre sozinho se o adb estiver autorizado e o bVNC instalado)."
-        )
+        where = f"{self._transport.client_host}:{self._server.port}"
+        if self._bvnc_auto:
+            lines.append(f"No tablet: o bVNC já abriu em {where}.")
+        else:
+            lines.append(f"No tablet: bVNC → {where}. Se não conectou, use o endereço e a senha acima.")
         return lines
 
     def wait(self) -> None:

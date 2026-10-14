@@ -29,6 +29,8 @@ from segunda_tela.vnc.encode import (
     decode_tight,
     encode_rect,
     encode_tight,
+    pack_cpixels,
+    tight_slices,
     parse_pixel_format,
     pick_encoding,
     pixel_format_bytes,
@@ -107,13 +109,26 @@ def test_pixel_format_roundtrip_and_preference():
 def test_tight_solid_and_pattern_roundtrip_bvnc_format():
     fmt = PixelFormat.bvnc()
     red = _rgbx(8, 6, bytes((255, 0, 0, 255)))
-    back = decode_tight(encode_tight(red, fmt), 8, 6, fmt)
+    wire = encode_tight(red, fmt)
+    # bVNC Tight paints byte0 as red. A shift-based CPIXEL would be 0,0,255.
+    assert wire[:4] == bytes((0x08, 255, 0, 0))
+    back = decode_tight(wire, 8, 6, fmt)
     assert back == red
-    # Not solid: two colours. Must survive B,G,R packing.
     mixed = bytearray(red)
     mixed[0:4] = bytes((0, 255, 10, 255))
     back = decode_tight(encode_tight(bytes(mixed), fmt), 8, 6, fmt)
     assert back == bytes(mixed)
+
+
+def test_raw_and_zrle_honor_bvnc_shifts():
+    """bVNC Raw/ZRLE use byte0 as blue when red shift is 16. Tight does not."""
+    fmt = PixelFormat.bvnc()
+    src = bytes((10, 20, 30, 255))  # R, G, B, X
+    _enc, raw = encode_rect(src, 1, 1, fmt, ENCODING_RAW)
+    assert raw == bytes((30, 20, 10, 0))
+    assert pack_cpixels(src, fmt) == bytes((30, 20, 10))
+    enc, dec = ZrleEncoder(), ZrleDecoder()
+    assert dec.decode(enc.encode(src, 1, 1, fmt), 1, 1, fmt) == src
 
 
 def test_zrle_stream_survives_two_rectangles_and_partial_tiles():
@@ -134,6 +149,16 @@ def test_raw_rect_keeps_rgbx_bytes():
     src = _rgbx(2, 2, bytes((4, 5, 6, 255)))
     enc, payload = encode_rect(src, 2, 2, fmt, ENCODING_RAW)
     assert enc == ENCODING_RAW and payload == src
+
+
+def test_cursor_sprite_is_visible_on_a_blank_rect():
+    from segunda_tela.vnc.encode import composite_cursor
+    blank = bytes(16 * 16 * 4)
+    out = composite_cursor(blank, 16, 16, 0, 0, 0, 0)
+    assert out[:4] == bytes((0, 0, 0, 255))
+    assert out != blank
+    missed = composite_cursor(blank, 4, 4, 100, 100, 0, 0)
+    assert missed == blank
 
 
 def test_solid_detector_and_coalesce():
@@ -161,6 +186,21 @@ def test_damage_tight_holds_30fps_for_a_window():
         assert len(payload) > 4
     elapsed = time.perf_counter() - t0
     assert elapsed < 1.0, f"30 damage frames took {elapsed:.3f}s"
+
+
+def test_full_frame_tight_pack_stays_interactive():
+    """1920x1200 used to take seconds in pure Python (log: 0.2 fps, ~3 MB)."""
+    np = pytest.importorskip("numpy")
+    fmt = PixelFormat.bvnc()
+    w, h = 1920, 1200
+    rng = np.random.default_rng(0)
+    arr = rng.integers(0, 256, size=(h, w, 4), dtype=np.uint8)
+    arr[..., 3] = 255
+    t0 = time.perf_counter()
+    slices = tight_slices(arr.tobytes(), w, h, fmt)
+    elapsed = time.perf_counter() - t0
+    assert slices and all(payload[0] in (0x08, 0x10) for *_box, payload in slices)
+    assert elapsed < 0.5, f"full-frame Tight took {elapsed:.3f}s"
 
 
 # ------------------------------------------------------------------- wayvnc decision
@@ -211,8 +251,10 @@ def test_listen_plan_and_bvnc_intent():
     assert uri.startswith("vnc://127.0.0.1:5900?")
     assert "VncPassword=Abcdef12" in uri
     shell = bvnc_shell("127.0.0.1", 5900, "Abcdef12")
-    assert "com.iiordanov.freebVNC" in shell
+    assert shell.startswith("am start -n ")
+    assert "com.iiordanov.freebVNC/com.iiordanov.bVNC.RemoteCanvasActivity" in shell
     assert "android.intent.action.VIEW" in shell
+    assert " -p " not in shell
     assert "Abcdef12" in shell
 
 
@@ -435,6 +477,23 @@ def test_rfb_serves_only_damaged_rgbx_and_rejects_a_bad_password():
         assert ready.wait(2)
         assert pointer[-1] == (3, 4, 1)
         sock.close()
+
+        # An incremental request with nothing new must stay open. Damage
+        # that arrives later is pushed without a second request — bVNC
+        # treats an empty FramebufferUpdate as "wait for my defer timer".
+        sock2, w2, h2 = _handshake(server.port, "s3cret99")
+        _request(sock2, 1, w2, h2)
+        _read_raw_update(sock2)
+        _request(sock2, 1, w2, h2)
+        time.sleep(0.05)
+        sock2.settimeout(0.25)
+        with pytest.raises(socket.timeout):
+            sock2.recv(1)
+        server.submit(src, [(0, 0, 8, 8)], w2, h2)
+        sock2.settimeout(2)
+        pushed = _read_raw_update(sock2)
+        assert pushed and pushed[0][0] == 0
+        sock2.close()
     finally:
         server.stop()
 

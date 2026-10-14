@@ -46,4 +46,6 @@ def vnc_checks(
         "" if free else "outro processo escuta 127.0.0.1 (segunda-tela --usb-vnc já rodando?)")
     yield "info", "bVNC no tablet", (
         "instale com.iiordanov.freebVNC (Play Store: bVNC). "
-        "Com o adb autorizado o app abre em vnc://127.0.0.1:5900")
+        "Com o adb autorizado o app abre em "
+        "com.iiordanov.freebVNC/com.iiordanov.bVNC.RemoteCanvasActivity "
+        "(vnc:// sem componente no One UI cai em outro app)")

@@ -14,6 +14,11 @@ from __future__ import annotations
 import zlib
 from dataclasses import dataclass
 
+try:
+    import numpy as np
+except ImportError:  # pragma: no cover - Pop!_OS ships python3-numpy; the loop remains for CI
+    np = None
+
 ENCODING_RAW = 0
 ENCODING_TIGHT = 7
 ENCODING_ZRLE = 16
@@ -103,12 +108,13 @@ def pick_encoding(offered: list[int]) -> int:
 
 
 def solid_rgbx(buf: bytes | bytearray | memoryview) -> bytes | None:
-    """The single RGBx pixel if every pixel matches, else None.
-
-    Adjacent pixels are compared in one memory compare: a solid buffer is
-    unchanged when shifted by one pixel.
-    """
+    """The single RGBx pixel if every pixel matches, else None."""
     if len(buf) < 4 or len(buf) % 4:
+        return None
+    if np is not None and len(buf) >= 16:
+        pix = np.frombuffer(buf, dtype=np.uint8).reshape(-1, 4)
+        if not np.any(pix[1:] != pix[0]):
+            return bytes(pix[0].tolist())
         return None
     raw = bytes(buf)
     if raw[4:] != raw[:-4]:
@@ -118,6 +124,10 @@ def solid_rgbx(buf: bytes | bytearray | memoryview) -> bytes | None:
 
 def crop_rgbx(buf: bytes | bytearray | memoryview, stride_px: int, x: int, y: int, w: int, h: int) -> bytes:
     """Tightly packed RGBx rectangle out of a (possibly wider) frame."""
+    if np is not None and stride_px > 0 and len(buf) >= stride_px * (y + h) * 4:
+        rows = len(buf) // (stride_px * 4)
+        frame = np.frombuffer(buf, dtype=np.uint8).reshape(rows, stride_px, 4)
+        return np.ascontiguousarray(frame[y:y + h, x:x + w]).tobytes()
     row = w * 4
     out = bytearray(row * h)
     src = memoryview(buf)
@@ -127,7 +137,21 @@ def crop_rgbx(buf: bytes | bytearray | memoryview, stride_px: int, x: int, y: in
     return bytes(out)
 
 
-def _pack_bgr(src: bytes) -> bytes:
+def _pixels(src: bytes | bytearray | memoryview):
+    arr = np.frombuffer(src, dtype=np.uint8)
+    n = arr.size // 4
+    return arr[: n * 4].reshape(n, 4)
+
+
+def _pack_bgr(src: bytes | bytearray | memoryview) -> bytes:
+    """RGBx → B,G,R. Little-endian CPIXEL when red is at shift 16."""
+    if np is not None:
+        pix = _pixels(src)
+        out = np.empty((pix.shape[0], 3), dtype=np.uint8)
+        out[:, 0] = pix[:, 2]
+        out[:, 1] = pix[:, 1]
+        out[:, 2] = pix[:, 0]
+        return out.tobytes()
     n = len(src) // 4
     out = bytearray(n * 3)
     mv = memoryview(src)
@@ -140,7 +164,31 @@ def _pack_bgr(src: bytes) -> bytes:
     return bytes(out)
 
 
-def _pack_rgb(src: bytes) -> bytes:
+def _pack_bgrx(src: bytes | bytearray | memoryview) -> bytes:
+    """RGBx → B,G,R,0. Raw PIXEL for bVNC C24bit (red shift 16, little endian)."""
+    if np is not None:
+        pix = _pixels(src)
+        out = np.zeros((pix.shape[0], 4), dtype=np.uint8)
+        out[:, 0] = pix[:, 2]
+        out[:, 1] = pix[:, 1]
+        out[:, 2] = pix[:, 0]
+        return out.tobytes()
+    n = len(src) // 4
+    out = bytearray(n * 4)
+    mv = memoryview(src)
+    for i in range(n):
+        s = i * 4
+        out[s] = mv[s + 2]
+        out[s + 1] = mv[s + 1]
+        out[s + 2] = mv[s]
+    return bytes(out)
+
+
+def _pack_rgb(src: bytes | bytearray | memoryview) -> bytes:
+    """RGBx → R,G,B (drop the pad). Tight truecolor bytes, see `pack_tight`."""
+    if np is not None:
+        pix = _pixels(src)
+        return np.ascontiguousarray(pix[:, :3]).tobytes()
     n = len(src) // 4
     out = bytearray(n * 3)
     mv = memoryview(src)
@@ -169,20 +217,45 @@ def _pack_generic(src: bytes, fmt: PixelFormat, nbytes: int) -> bytes:
     return bytes(out)
 
 
-def pack_cpixels(rgbx: bytes, fmt: PixelFormat) -> bytes:
+def pack_cpixels(rgbx: bytes | bytearray | memoryview, fmt: PixelFormat) -> bytes:
+    """ZRLE CPIXEL. Honors shifts: bVNC's ZRLE decoder uses byte0 as blue for C24bit."""
     if fmt.is_bgr_cpixel():
         return _pack_bgr(rgbx)
     if fmt.cpixel_bytes == 3 and fmt.is_rgbx_bytes():
         return _pack_rgb(rgbx)
     if fmt.cpixel_bytes == 4 and fmt.is_rgbx_bytes():
-        return rgbx
+        return bytes(rgbx)
     return _pack_generic(rgbx, fmt, fmt.cpixel_bytes)
 
 
-def pack_pixels(rgbx: bytes, fmt: PixelFormat) -> bytes:
-    """Full PIXEL (Raw encoding), not the 3-byte CPIXEL."""
+def pack_tight(rgbx: bytes | bytearray | memoryview, fmt: PixelFormat) -> bytes:
+    """Tight truecolor bytes.
+
+    bVNC `Decoder.handleTightRect` paints `(b0<<16)|(b1<<8)|b2` into an
+    Android ARGB int, so byte0 is red. It does not apply redShift. Raw and
+    ZRLE in that same class do (`b2` is red), which matches C24bit shifts
+    16,8,0. Tight on this client is therefore R,G,B from the RGBx grab.
+    A shift-based B,G,R triplet is what made the tablet show red and blue
+    swapped.
+    """
+    if fmt.true_color and fmt.cpixel_bytes == 3 and fmt.red_max == 255 and not fmt.big_endian:
+        return _pack_rgb(rgbx)
+    return pack_cpixels(rgbx, fmt)
+
+
+def pack_pixels(rgbx: bytes | bytearray | memoryview, fmt: PixelFormat) -> bytes:
+    """Full PIXEL (Raw encoding), not the 3-byte CPIXEL.
+
+    bVNC's Raw path uses byte0 as blue when it asked for red shift 16.
+    """
     if fmt.is_rgbx_bytes() and fmt.bpp == 32:
-        return rgbx
+        return bytes(rgbx)
+    if (
+        fmt.bpp == 32 and not fmt.big_endian and fmt.true_color
+        and (fmt.red_shift, fmt.green_shift, fmt.blue_shift) == (16, 8, 0)
+        and fmt.red_max == 255 and fmt.green_max == 255 and fmt.blue_max == 255
+    ):
+        return _pack_bgrx(rgbx)
     return _pack_generic(rgbx, fmt, fmt.bytes_per_pixel)
 
 
@@ -227,12 +300,19 @@ def read_compact(data: bytes, offset: int) -> tuple[int, int]:
     return value, offset
 
 
+def _tight_triplet_to_rgbx(pix: bytes) -> bytes:
+    """Inverse of `pack_tight` for a 24-bit triplet (byte0 = red)."""
+    if len(pix) == 3:
+        return bytes((pix[0], pix[1], pix[2], 255))
+    return cpixel_to_rgbx(pix, PixelFormat.rgbx())
+
+
 def encode_tight(rgbx: bytes, fmt: PixelFormat, level: int = 1) -> bytes:
     """One Tight rectangle payload (no x/y/w/h header)."""
     solid = solid_rgbx(rgbx)
     if solid is not None:
-        return bytes((0x08,)) + pack_cpixels(solid, fmt)
-    pixels = pack_cpixels(rgbx, fmt)
+        return bytes((0x08,)) + pack_tight(solid, fmt)
+    pixels = pack_tight(rgbx, fmt)
     # Bit 4 resets zlib stream 0. Low nibble 0 = basic compression, copy filter.
     control = 0x10
     if len(pixels) < TIGHT_MIN_COMPRESS:
@@ -251,7 +331,7 @@ def decode_tight(payload: bytes, width: int, height: int, fmt: PixelFormat) -> b
     count = width * height
     if low == 0x08:
         pix = payload[offset:offset + fmt.cpixel_bytes]
-        one = cpixel_to_rgbx(pix, fmt)
+        one = _tight_triplet_to_rgbx(pix) if fmt.cpixel_bytes == 3 else cpixel_to_rgbx(pix, fmt)
         return one * count
     if low in (0x09, 0x0A):
         raise ValueError("JPEG/PNG tight is not produced")
@@ -265,8 +345,9 @@ def decode_tight(payload: bytes, width: int, height: int, fmt: PixelFormat) -> b
         pixels = zlib.decompress(payload[offset:offset + comp_len])
     cb = fmt.cpixel_bytes
     out = bytearray(count * 4)
+    convert = _tight_triplet_to_rgbx if cb == 3 else (lambda pix: cpixel_to_rgbx(pix, fmt))
     for i in range(count):
-        out[i * 4:(i + 1) * 4] = cpixel_to_rgbx(pixels[i * cb:(i + 1) * cb], fmt)
+        out[i * 4:(i + 1) * 4] = convert(pixels[i * cb:(i + 1) * cb])
     return bytes(out)
 
 
@@ -337,6 +418,34 @@ def _paint_zrle(data: bytes, width: int, height: int, fmt: PixelFormat) -> bytes
     return bytes(canvas)
 
 
+def tight_slices(
+    rgbx: bytes,
+    width: int,
+    height: int,
+    fmt: PixelFormat,
+    level: int = 1,
+    y0: int = 0,
+) -> list[tuple[int, int, int, int, bytes]]:
+    """Tight rectangles covering `rgbx`.
+
+    One zlib stream per slice. A slice whose compressed size does not fit
+    in Tight's 22-bit length is split in half. Desktop frames usually stay
+    one rectangle; random noise does not.
+    """
+    try:
+        payload = encode_tight(rgbx, fmt, level=level)
+    except ValueError:
+        if height <= 1:
+            raise
+        mid = max(1, height // 2)
+        stride = width * 4
+        return (
+            tight_slices(rgbx[: mid * stride], width, mid, fmt, level, y0)
+            + tight_slices(rgbx[mid * stride:], width, height - mid, fmt, level, y0 + mid)
+        )
+    return [(0, y0, width, height, payload)]
+
+
 def encode_rect(
     rgbx: bytes,
     width: int,
@@ -372,7 +481,9 @@ def coalesce_rects(
     if not norm:
         return []
     area = sum((x2 - x1) * (y2 - y1) for x1, y1, x2, y2 in norm)
-    if area * 2 >= width * height:
+    # Only a nearly full redraw becomes one rectangle. Half the desktop used
+    # to, and then every update was a 1920x1200 pack.
+    if area * 5 >= width * height * 4:
         return [(0, 0, width, height)]
     merged = _merge_touching(norm)
     if len(merged) > max_rects:
@@ -419,3 +530,94 @@ def _merge_touching(rects: list[tuple[int, int, int, int]]) -> list[tuple[int, i
 
 def xywh(rects: list[tuple[int, int, int, int]]) -> list[tuple[int, int, int, int]]:
     return [(x1, y1, x2 - x1, y2 - y1) for x1, y1, x2, y2 in rects]
+
+
+# 12×19 arrow. 'X' outline, '+' fill, '.' transparent. Drawn into the VNC
+# frame because the compositor cursor plane is not in the EVDI grab, so the
+# tablet otherwise shows a picture with no pointer.
+_CURSOR_ROWS = (
+    "X...........",
+    "XX..........",
+    "X+X.........",
+    "X++X........",
+    "X+++X.......",
+    "X++++X......",
+    "X+++++X.....",
+    "X++++++X....",
+    "X+++++++X...",
+    "X++++++++X..",
+    "X+++++XXXX..",
+    "X++X++X.....",
+    "X+X.X++X....",
+    "XX..X++X....",
+    "X....X++X...",
+    ".....X++X...",
+    "......X++X..",
+    "......X++X..",
+    ".......XX...",
+)
+CURSOR_W = len(_CURSOR_ROWS[0])
+CURSOR_H = len(_CURSOR_ROWS)
+
+
+def cursor_sprite() -> bytes:
+    out = bytearray(CURSOR_W * CURSOR_H * 4)
+    for y, row in enumerate(_CURSOR_ROWS):
+        for x, ch in enumerate(row):
+            if ch == ".":
+                continue
+            # Outline black, fill white. Both opaque so it shows on any desktop.
+            rgb = (0, 0, 0) if ch == "X" else (255, 255, 255)
+            i = (y * CURSOR_W + x) * 4
+            out[i:i + 4] = bytes((*rgb, 255))
+    return bytes(out)
+
+
+_SPRITE = cursor_sprite()
+
+
+def cursor_bounds(x: int, y: int, width: int, height: int) -> tuple[int, int, int, int]:
+    """Exclusive-end rectangle covering the sprite at `x, y`, clipped to the frame."""
+    x1 = 0 if x < 0 else width if x > width else x
+    y1 = 0 if y < 0 else height if y > height else y
+    x2 = x + CURSOR_W
+    y2 = y + CURSOR_H
+    x2 = 0 if x2 < 0 else width if x2 > width else x2
+    y2 = 0 if y2 < 0 else height if y2 > height else y2
+    if x2 <= x1 or y2 <= y1:
+        return (0, 0, 0, 0)
+    return (x1, y1, x2, y2)
+
+
+def composite_cursor(
+    rgbx: bytes,
+    rect_w: int,
+    rect_h: int,
+    rect_x: int,
+    rect_y: int,
+    cursor_x: int,
+    cursor_y: int,
+) -> bytes:
+    """Paint the arrow onto a tightly packed RGBx rectangle. No-op when it misses."""
+    if rect_w <= 0 or rect_h <= 0:
+        return rgbx
+    if cursor_x >= rect_x + rect_w or cursor_y >= rect_y + rect_h:
+        return rgbx
+    if cursor_x + CURSOR_W <= rect_x or cursor_y + CURSOR_H <= rect_y:
+        return rgbx
+    out = bytearray(rgbx)
+    for sy in range(CURSOR_H):
+        fy = cursor_y + sy
+        if fy < rect_y or fy >= rect_y + rect_h:
+            continue
+        row = sy * CURSOR_W
+        for sx in range(CURSOR_W):
+            fx = cursor_x + sx
+            if fx < rect_x or fx >= rect_x + rect_w:
+                continue
+            si = (row + sx) * 4
+            if _SPRITE[si + 3] == 0:
+                continue
+            di = ((fy - rect_y) * rect_w + (fx - rect_x)) * 4
+            out[di:di + 4] = _SPRITE[si:si + 4]
+    return bytes(out)

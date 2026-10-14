@@ -22,11 +22,15 @@ from .encode import (
     ENCODING_CONTINUOUS,
     ENCODING_DESKTOP_SIZE,
     ENCODING_RAW,
+    ENCODING_TIGHT,
     PixelFormat,
     ZrleEncoder,
     coalesce_rects,
+    composite_cursor,
     crop_rgbx,
+    cursor_bounds,
     encode_rect,
+    tight_slices,
     parse_pixel_format,
     pick_encoding,
     pixel_format_bytes,
@@ -51,7 +55,10 @@ class _Client:
     encoding: int = ENCODING_RAW
     zrle: ZrleEncoder = field(default_factory=ZrleEncoder)
     dirty: list[tuple[int, int, int, int]] = field(default_factory=list)
-    requested: bool = False
+    # Outstanding FramebufferUpdateRequests. An incremental request with no
+    # damage is kept here until a rect exists — an empty reply makes bVNC
+    # wait out its defer timer, so the picture freezes between grabs.
+    pending_requests: int = 0
     incremental: bool = True
     force_full: bool = False
     continuous: bool = False
@@ -96,6 +103,10 @@ class VncServer:
         self._stat_t0 = time.monotonic()
         self._stat_updates = 0
         self._stat_bytes = 0
+        self._stat_pointers = 0
+        self._cursor: Optional[tuple[int, int]] = None
+        self._logged_format = False
+        self._logged_pointer = False
         self.on_resize: Optional[Callable[[int, int], None]] = None
 
     # ----------------------------------------------------------------- lifecycle
@@ -327,6 +338,11 @@ class VncServer:
                     return True
                 raw = self._recv(client, 20)
                 client.fmt = parse_pixel_format(raw[4:20])
+                fmt = client.fmt
+                log.info(
+                    "VNC SetPixelFormat bpp=%s depth=%s big_endian=%s shifts r=%s g=%s b=%s",
+                    fmt.bpp, fmt.depth, fmt.big_endian, fmt.red_shift, fmt.green_shift, fmt.blue_shift,
+                )
             elif kind == 2:
                 if len(client.buf) < 4:
                     return True
@@ -338,6 +354,7 @@ class VncServer:
                 encs = list(struct.unpack(f">{count}i", raw[4:]))
                 client.encodings = encs
                 client.encoding = pick_encoding(encs)
+                log.info("VNC encodings prefer %s (oferecidas %s)", client.encoding, encs[:8])
                 if ENCODING_CONTINUOUS in encs and not client.continuous:
                     # The enable message (150) is authoritative; listing it
                     # only records interest. Some clients push frames only
@@ -349,7 +366,7 @@ class VncServer:
                 raw = self._recv(client, 10)
                 _x, _y, _w, _h = struct.unpack_from(">HHHH", raw, 2)
                 client.incremental = bool(raw[1])
-                client.requested = True
+                client.pending_requests = min(8, client.pending_requests + 1)
                 if not client.incremental:
                     client.force_full = True
                 del _x, _y, _w, _h
@@ -362,11 +379,7 @@ class VncServer:
                     return True
                 raw = self._recv(client, 6)
                 buttons, x, y = raw[1], struct.unpack_from(">H", raw, 2)[0], struct.unpack_from(">H", raw, 4)[0]
-                if self.on_pointer:
-                    try:
-                        self.on_pointer(x, y, buttons)
-                    except Exception as exc:  # noqa: BLE001
-                        log.warning("pointer: %s", exc)
+                self._pointer(x, y, buttons)
             elif kind == 6:
                 if len(client.buf) < 8:
                     return True
@@ -389,10 +402,46 @@ class VncServer:
             return max(0.0, client.next_send - time.monotonic())
         return 0.5
 
+    def _pointer(self, x: int, y: int, buttons: int) -> None:
+        """Inject the finger and dirty the sprite so the tablet shows the cursor."""
+        with self._lock:
+            width, height = self.w, self.h
+        x = 0 if x < 0 else width - 1 if x >= width else x
+        y = 0 if y < 0 else height - 1 if y >= height else y
+        if self.on_pointer:
+            try:
+                self.on_pointer(x, y, buttons)
+            except Exception as exc:  # noqa: BLE001
+                log.warning("pointer: %s", exc)
+        wakes: list[_Client] = []
+        with self._lock:
+            old = self._cursor
+            self._cursor = (x, y)
+            rects = []
+            for pos in (old, (x, y)):
+                if pos is None:
+                    continue
+                bounds = cursor_bounds(pos[0], pos[1], self.w, self.h)
+                if bounds[2] > bounds[0] and bounds[3] > bounds[1]:
+                    rects.append(bounds)
+            for client in self._clients:
+                if not client.alive:
+                    continue
+                client.dirty.extend(rects)
+                wakes.append(client)
+        for client in wakes:
+            self._wake(client)
+        self._stat_pointers += 1
+        if not self._logged_pointer:
+            self._logged_pointer = True
+            log.info("VNC pointer x=%s y=%s buttons=%s (uinput se o toque abriu)", x, y, buttons)
+        else:
+            log.debug("VNC pointer x=%s y=%s buttons=%s", x, y, buttons)
+
     def _wants_send(self, client: _Client) -> bool:
-        if not (client.continuous or client.requested):
+        if not (client.continuous or client.pending_requests):
             return False
-        return bool(client.dirty or client.force_full or client.need_desktop_size or client.requested)
+        return bool(client.dirty or client.force_full or client.need_desktop_size)
 
     def _flush(self, client: _Client) -> None:
         if not client.alive:
@@ -401,19 +450,27 @@ class VncServer:
         if now < client.next_send and not client.force_full:
             return
         with self._lock:
-            if not (client.continuous or client.requested):
+            if not (client.continuous or client.pending_requests):
                 return
             width, height = self.w, self.h
+            cursor = self._cursor
             if client.force_full:
                 areas = [(0, 0, width, height)]
                 client.dirty.clear()
                 client.force_full = False
             elif client.dirty:
-                areas = xywh(coalesce_rects(client.dirty, width, height))
+                pending = list(client.dirty)
+                if cursor is not None:
+                    bounds = cursor_bounds(cursor[0], cursor[1], width, height)
+                    if bounds[2] > bounds[0]:
+                        pending.append(bounds)
+                areas = xywh(coalesce_rects(pending, width, height))
                 client.dirty.clear()
-            elif client.requested or client.need_desktop_size:
+            elif client.need_desktop_size:
                 areas = []
             else:
+                # Request is outstanding and the framebuffer has not changed.
+                # Keep it. The next submit() or pointer wakes this client.
                 return
             desktop = None
             if client.need_desktop_size and ENCODING_DESKTOP_SIZE in client.encodings:
@@ -423,27 +480,32 @@ class VncServer:
             fmt = client.fmt
             encoding = client.encoding
             zrle = client.zrle
-            send_empty = client.requested and not areas and desktop is None
-            if not client.continuous:
-                client.requested = False
-        if send_empty:
-            try:
-                client.sock.sendall(struct.pack(">BBH", 0, 0, 0))
-            except OSError:
-                client.alive = False
-            client.next_send = time.monotonic() + 1.0 / self.fps
-            return
+            if not client.continuous and client.pending_requests:
+                client.pending_requests -= 1
+        if cursor is not None:
+            snaps = [
+                composite_cursor(snap, w, h, x, y, cursor[0], cursor[1])
+                for (x, y, w, h), snap in zip(areas, snaps)
+            ]
         if not areas and desktop is None:
             return
+        t0 = time.perf_counter()
         pieces: list[tuple[int, int, int, int, int, bytes]] = []
         if desktop:
             pieces.append((0, 0, desktop[0], desktop[1], ENCODING_DESKTOP_SIZE, b""))
         for (x, y, w, h), rgbx in zip(areas, snaps):
             if w <= 0 or h <= 0:
                 continue
+            if encoding == ENCODING_TIGHT:
+                for _sx, sy, sw, sh, payload in tight_slices(rgbx, w, h, fmt):
+                    pieces.append((x, y + sy, sw, sh, ENCODING_TIGHT, payload))
+                continue
             enc, payload = encode_rect(rgbx, w, h, fmt, encoding, zrle=zrle)
             pieces.append((x, y, w, h, enc, payload))
         if not pieces:
+            with self._lock:
+                if not client.continuous:
+                    client.pending_requests = min(8, client.pending_requests + 1)
             return
         msg = bytearray(struct.pack(">BBH", 0, 0, len(pieces)))
         for x, y, w, h, enc, payload in pieces:
@@ -456,6 +518,9 @@ class VncServer:
             return
         client.updates += 1
         client.bytes_out += len(msg)
+        encode_s = time.perf_counter() - t0
+        if encode_s >= 0.05:
+            log.info("VNC encode %.0f ms, %d rects, %d KB", encode_s * 1000, len(pieces), len(msg) // 1024)
         client.next_send = time.monotonic() + 1.0 / self.fps
         self._stat_updates += 1
         self._stat_bytes += len(msg)
@@ -467,9 +532,11 @@ class VncServer:
         if dt < 5.0:
             return
         log.info(
-            "VNC fps %.1f (%d updates, %.0f KB in %.1fs)",
+            "VNC fps %.1f (%d updates, %.0f KB in %.1fs, %d pointer)",
             self._stat_updates / dt, self._stat_updates, self._stat_bytes / 1024, dt,
+            self._stat_pointers,
         )
         self._stat_updates = 0
         self._stat_bytes = 0
+        self._stat_pointers = 0
         self._stat_t0 = now

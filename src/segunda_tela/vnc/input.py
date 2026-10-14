@@ -175,7 +175,9 @@ class EvdiTouch:
             return
         x = 0 if x < 0 else self._w - 1 if x >= self._w else x
         y = 0 if y < 0 else self._h - 1 if y >= self._h else y
-        contact = bool(buttons & 1)
+        # bVNC's left button is bit 0. Any button is a finger: a mask that is
+        # not 1 still has to land on the EVDI output, not be dropped.
+        contact = bool(buttons)
         with self._lock:
             if contact:
                 if not self._down:

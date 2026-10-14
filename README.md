@@ -229,7 +229,7 @@ don't reproduce, so open "Second screen" on the tablet first; Wi-Fi Direct
 (adb, authorization, tether iface/IP, peer reachability, ports). Details:
 [docs/USB.md](docs/USB.md). Samsung's MCF one-tap pairing is out of scope.
 
-`segunda-tela --usb-vnc` (0.3.5) is the cable path that does not use Miracast:
+`segunda-tela --usb-vnc` (0.3.6) is the cable path that does not use Miracast:
 the EVDI output is placed to the right of eDP-1 and served alone over VNC
 through `adb reverse tcp:5900`, with bVNC Free launched on the tablet and
 touch injected by a uinput device mapped to that output. noble's wayvnc 0.7.2
