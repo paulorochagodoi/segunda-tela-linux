@@ -236,8 +236,11 @@ class UsbVncSession:
                 need = width * height * 4
                 if len(frame) < need:
                     continue
-                rects = damage or [(0, 0, width, height)]
-                server.submit(frame[:need], rects, width, height)
+                # Only the clips evdi_grab_pixels returned. Inventing a full
+                # framebuffer here made every update one 1920×1200 rectangle.
+                if not damage:
+                    continue
+                server.submit(frame[:need], damage, width, height)
             finally:
                 release = getattr(mon, "release_frame", None)
                 if release:

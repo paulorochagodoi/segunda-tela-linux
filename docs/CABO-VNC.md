@@ -26,8 +26,9 @@ funciona com `--disable-input`. Sem os eventos de ponteiro não há como injetar
 o toque num dispositivo uinput mapeado só na saída EVDI.
 
 Por isso o `--usb-vnc` lê o framebuffer do EVDI (a mesma captura direta do modo
-estender, formato RGBx) e fala RFB ele mesmo: retângulos de dano, Tight e
-ZRLE, senha VNC clássica.
+estender, formato RGBx) e fala RFB ele mesmo: só os retângulos que o
+`evdi_grab_pixels` devolveu, Tight (JPEG ~70 em região de foto, zlib no resto)
+ou ZRLE, no máximo ~30 fps na saída, senha VNC clássica.
 
 ## Uma vez no PC
 
@@ -127,13 +128,26 @@ A seção `-- USB --` continua valendo para o adb (autorização, cabo Samsung).
 - O grab do EVDI é RGBx (fourcc AB24). O bVNC pede shifts 16,8,0. Raw e ZRLE
   seguem isso (byte 0 = azul). O Tight do bVNC **não**: `Decoder.handleTightRect`
   pinta o byte 0 como vermelho. O servidor manda R,G,B no Tight por causa disso.
+  O byte de controle do Tight tem o tipo no nibble alto (preenchimento `0x80`,
+  JPEG `0x90`, zlib com reset do stream 0 em `0x01`) — é assim que o bVNC
+  desloca os 4 bits de reset antes de ler o subtipo.
+- Cada cliente VNC tem uma thread só para ler. O `sendall` de um quadro no adb
+  bloqueia; o ponteiro é lido e injetado no uinput nessa outra thread. O log
+  mostra `VNC pointer` (mudança de botão na hora, movimento algumas vezes por
+  segundo) e a linha `VNC fps` conta todos.
+- A saída VNC fica em ~30 fps mesmo com `--fps 60`. O grab do EVDI continua na
+  taxa do monitor. O log `EVDI grab fps` inclui sync/async/reask, o tempo do
+  `grab_pixels` e o último retângulo (quantidade e pixels). Se `last 1 rects`
+  for a tela inteira, o kernel só entregou um clip — o JPEG é o que reduz o
+  tamanho, não dá para inventar dano menor.
+- Foto vai em JPEG qualidade ~70 (simplejpeg, senão turbojpeg, senão Pillow),
+  com nova tentativa em 55/40/30 se passar de ~200 KB. Interface com poucas
+  cores ou borda dura fica em zlib. Sem Pillow e sem simplejpeg o JPEG não
+  existe e a região fotográfica volta para zlib (o `install.sh` instala os dois).
 - O cursor do compositor não entra no grab do EVDI. O VNC desenha uma seta na
   posição do dedo. O toque em si vai para o uinput mapeado em `DVI-I-1`.
 - Um pedido incremental sem pixels novos fica pendente até chegar dano. Uma
   resposta vazia faz o bVNC esperar o timer dele e a imagem parece parada.
-- Empacotar 1920×1200 em Python puro levava segundos (o log do Tab mostrou
-  ~0,2 fps e vários MB por quadro). Com numpy o Tight de um quadro inteiro
-  cabe numa fração de segundo; janela de dano continua o caminho rápido.
 - O `map_to_output` do cosmic-comp vale para touchscreen. Versões recentes
   releem `input_devices` sozinhas; se o toque cair no eDP-1, saia e entre na
   sessão ou confira o nome da saída com `cosmic-randr list` (algo como
@@ -165,4 +179,7 @@ cosmic-comp does not implement. bVNC is started with `am start -n` on
 `com.iiordanov.freebVNC/com.iiordanov.bVNC.RemoteCanvasActivity` (a bare
 `vnc://` VIEW intent opened Emergency alerts on One UI). Tight bytes are
 R,G,B because bVNC's Tight decoder paints byte 0 as red; Raw and ZRLE follow
-the C24bit shifts. See the Portuguese sections for the procedure.
+the C24bit shifts. Photo damage is Tight JPEG (control `0x90`, quality about
+70); other damage is zlib. Only EVDI's dirty rectangles are sent, capped
+around 30 fps, and pointer events are read on a thread that does not wait
+on `sendall`. See the Portuguese sections for the procedure.

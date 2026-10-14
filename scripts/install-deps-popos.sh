@@ -14,7 +14,8 @@ apt-get install -y \
   xdg-desktop-portal \
   network-manager wpasupplicant \
   android-tools-adb \
-  python3-numpy
+  python3-numpy \
+  python3-pil
 
 # Encoder H.264 por hardware (AMD/Intel): `vah264enc` vem do plugins-bad (plugin va);
 # `vaapih264enc` do gstreamer1.0-vaapi (legado). mesa-va-drivers = VA-API do amdgpu.
@@ -43,7 +44,7 @@ udevadm trigger --name-match=uinput || true
 echo "Regra udev do uinput instalada. Se o toque do --usb-vnc falhar, saia e entre de novo na sessão."
 
 echo "Dependências OK (python3-gi + GTK4/libadwaita + GStreamer + VA-API + portal + EVDI + adb)."
-echo "VNC do cabo (--usb-vnc) não usa biblioteca extra: o servidor RFB é Python (zlib)."
+echo "VNC do cabo (--usb-vnc): numpy empacota pixels; Pillow ou simplejpeg faz Tight JPEG (o install.sh instala os dois no .venv)."
 echo "Depois:"
 echo "  sudo ./scripts/setup-evdi.sh   # carrega evdi com 1 dispositivo + regra udev"
 echo "  ./scripts/install.sh           # cria venv com --system-site-packages"

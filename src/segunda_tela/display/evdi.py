@@ -145,6 +145,20 @@ def blit_damage(
     return copied
 
 
+def _cap_damage(
+    rects: list[tuple[int, int, int, int]],
+    width: int,
+    height: int,
+) -> list[tuple[int, int, int, int]]:
+    """Keep at most MAX_DIRTY_RECTS clips without expanding them to the frame."""
+    try:
+        from segunda_tela.vnc.encode import coalesce_rects
+    except Exception:  # noqa: BLE001 — display must still publish if VNC isn't imported
+        return rects[-MAX_DIRTY_RECTS:]
+    folded = coalesce_rects(rects, width, height, max_rects=MAX_DIRTY_RECTS)
+    return folded or rects[-MAX_DIRTY_RECTS:]
+
+
 class ShadowFrames:
     """Two full frames. The grab paints into the buffer the feeder is not writing.
 
@@ -275,9 +289,16 @@ class EvdiMonitor:
         self._rects = (EvdiRect * MAX_DIRTY_RECTS)()
         self._buf_id = 1
         self._pending = False
+        self._pending_since = 0.0
         self._stat_t0 = time.monotonic()
         self._stat_grabs = 0
         self._stat_frames = 0
+        self._stat_sync = 0
+        self._stat_async = 0
+        self._stat_reask = 0
+        self._stat_grab_ms = 0.0
+        self._last_rects = 0
+        self._last_px = 0
         self._damage: list[tuple[int, int, int, int]] = []
         self._ctx = EvdiEventContext(
             dpms_handler=_DPMS_CB(self._on_dpms),
@@ -414,6 +435,7 @@ class EvdiMonitor:
 
     def _on_update_ready(self, _buffer_id: int, _ud) -> None:
         self._pending = False
+        self._stat_async += 1
         self._grab_now()
 
     # -------------------------------------------------------------- internals
@@ -440,21 +462,35 @@ class EvdiMonitor:
     def _grab_now(self) -> None:
         if not (self._lib and self._handle and self._buf_desc is not None and self._buf is not None):
             return
-        n = ctypes.c_int(0)
+        # Current libevdi ignores this capacity and asks the kernel for
+        # MAX_DIRTS (16). Older builds treat the value as the cap; 0 makes
+        # those ioctls fail and the grab reports no rects.
+        n = ctypes.c_int(MAX_DIRTY_RECTS)
+        t0 = time.perf_counter()
         # The ioctl copies only dirty rectangles into the registered buffer.
         self._lib.evdi_grab_pixels(self._handle, self._rects, ctypes.byref(n))
+        self._stat_grab_ms += (time.perf_counter() - t0) * 1000.0
         count = max(0, int(n.value))
         rects = [
             (int(self._rects[i].x1), int(self._rects[i].y1), int(self._rects[i].x2), int(self._rects[i].y2))
             for i in range(min(count, MAX_DIRTY_RECTS))
         ]
+        area = 0
+        for x1, y1, x2, y2 in rects:
+            if x2 > x1 and y2 > y1:
+                area += (x2 - x1) * (y2 - y1)
+        self._last_rects = len(rects)
+        self._last_px = area
         with self._frame_lock:
             self._stat_grabs += 1
             if self._slots is not None and self._slots.apply(memoryview(self._buf), rects):
                 self._frame_seq = self._slots.seq
                 self._damage.extend(rects)
-                if len(self._damage) > 64 and self._slots is not None:
-                    self._damage = [(0, 0, self._slots.width, self._slots.height)]
+                # Fold a backlog into at most MAX_DIRTY_RECTS. Replacing it
+                # with the whole framebuffer is what made every VNC update
+                # one 1920x1200 rectangle when the pump was behind the grab.
+                if len(self._damage) > MAX_DIRTY_RECTS:
+                    self._damage = _cap_damage(self._damage, self._slots.width, self._slots.height)
                 self._stat_frames += 1
                 self._frame_lock.notify_all()
             self._log_grab_fps()
@@ -464,13 +500,21 @@ class EvdiMonitor:
         dt = now - self._stat_t0
         if dt < 5.0:
             return
+        grab_ms = self._stat_grab_ms / self._stat_grabs if self._stat_grabs else 0.0
         log.info(
-            "EVDI grab fps %.1f (%d grabs, %d updated frames in %.1fs, fourcc=%s, format=%s)",
+            "EVDI grab fps %.1f (%d grabs, %d updated frames in %.1fs, "
+            "sync %d, async %d, reask %d, grab %.1f ms, last %d rects %d px, fourcc=%s, format=%s)",
             self._stat_grabs / dt, self._stat_grabs, self._stat_frames, dt,
+            self._stat_sync, self._stat_async, self._stat_reask, grab_ms,
+            self._last_rects, self._last_px,
             fourcc_str(self.pixel_format), EVDI_RAW_FORMAT,
         )
         self._stat_grabs = 0
         self._stat_frames = 0
+        self._stat_sync = 0
+        self._stat_async = 0
+        self._stat_reask = 0
+        self._stat_grab_ms = 0.0
         self._stat_t0 = now
 
     def _loop(self) -> None:
@@ -484,14 +528,37 @@ class EvdiMonitor:
             if self.grab and self._buf_desc is None and self.mode is not None:
                 self._register_buffer(self.mode[0], self.mode[1])
             now = time.monotonic()
+            # A lost update-ready used to leave `_pending` set, so the loop
+            # stopped calling evdi_request_update and the grab sat at a few fps.
+            if (
+                self._pending
+                and now - self._pending_since >= max(0.05, interval * 2)
+            ):
+                self._pending = False
+                self._stat_reask += 1
             if self.grab and self._buf_desc is not None and not self._pending and now >= next_req:
                 next_req = now + interval
                 if self._lib.evdi_request_update(self._handle, self._buf_id):
+                    self._stat_sync += 1
                     self._grab_now()
                 else:
                     self._pending = True
+                    self._pending_since = now
+            # Wait only until the next request is due. A full interval after
+            # a grab that already missed its slot capped the pump near 8 fps
+            # whenever pixel copy or the GIL ran long.
+            remain = next_req - time.monotonic()
+            if self._pending:
+                due = self._pending_since + max(0.05, interval * 2) - time.monotonic()
+                timeout = min(0.02, due if due > 0 else 0.02)
+            elif not (self.grab and self._buf_desc is not None):
+                # No request schedule yet (waiting for a mode). The old
+                # `min(interval, 0.1)` sleep; a zero timeout busy-spins.
+                timeout = min(interval, 0.1)
+            else:
+                timeout = 0.0 if remain <= 0 else min(remain, interval)
             try:
-                ready, _, _ = select.select([fd], [], [], min(interval, 0.1))
+                ready, _, _ = select.select([fd], [], [], timeout)
             except (OSError, ValueError):
                 break
             if ready:

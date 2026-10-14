@@ -3,16 +3,27 @@
 The EVDI grab is RGBx (byte0 = R). bVNC's default 24-bit mode asks for
 little-endian shifts red=16, green=8, blue=0, so a CPIXEL is B,G,R.
 Tight and ZRLE use that 3-byte CPIXEL when bpp is 32 and depth is 24 or
-less (RFC 6143). Solid rectangles are a Tight fill (4 bytes on the wire)
-instead of a compressed bitmap.
+less (RFC 6143). Solid rectangles are a Tight fill instead of a compressed
+bitmap.
 
-zlib level 1 is deliberate: desktop damage is highly compressible and the
-30 fps budget is spent on packing pixels, not on squeezing the last byte.
+bVNC (and TightVNC) treat the low 4 bits of the Tight control byte as zlib
+stream resets and the high nibble, after shifting those bits off, as the
+subencoding. Fill is 0x80, JPEG is 0x90, basic compression with stream 0
+reset is 0x01. A low-nibble 0x09 is basic compression to that client, which
+is why a JPEG has to carry the type in the high nibble.
+
+Photo-like damage is Tight JPEG around quality 70 (simplejpeg, then
+turbojpeg, then Pillow). UI-like damage stays zlib level 1. The byte budget
+retries a lower quality so one rectangle stays near 200 KB over adb.
 """
 from __future__ import annotations
 
+import io
+import logging
 import zlib
 from dataclasses import dataclass
+
+log = logging.getLogger(__name__)
 
 try:
     import numpy as np
@@ -27,6 +38,13 @@ ENCODING_CONTINUOUS = -313  # pseudo; client offers it, then sends message 150
 
 SUPPORTED_RECT_ENCODINGS = (ENCODING_TIGHT, ENCODING_ZRLE, ENCODING_RAW)
 TIGHT_MIN_COMPRESS = 12
+# High nibble = subencoding, low 4 bits = zlib stream resets. See module doc.
+TIGHT_BASIC_RESET = 0x01
+TIGHT_FILL = 0x80
+TIGHT_JPEG = 0x90
+JPEG_QUALITY = 70
+JPEG_BYTE_BUDGET = 200 * 1024
+PHOTO_MIN_PIXELS = 96 * 96
 
 
 @dataclass(frozen=True)
@@ -307,14 +325,188 @@ def _tight_triplet_to_rgbx(pix: bytes) -> bytes:
     return cpixel_to_rgbx(pix, PixelFormat.rgbx())
 
 
-def encode_tight(rgbx: bytes, fmt: PixelFormat, level: int = 1) -> bytes:
+def tight_subencoding(control: int) -> int:
+    """Subencoding after bVNC shifts the four zlib-reset bits off."""
+    comp = control & 0xFF
+    for _ in range(4):
+        comp >>= 1
+    return comp
+
+
+def looks_photographic(rgbx: bytes | bytearray | memoryview, width: int, height: int) -> bool:
+    """True when a rectangle is smooth and has many colors (a photo, not UI).
+
+    Text and flat chrome stay on zlib: they have few colors or hard edges,
+    and JPEG rings around glyphs. A gradient or camera image has many similar
+    neighbors.
+    """
+    if width < 2 or height < 2 or width * height < PHOTO_MIN_PIXELS:
+        return False
+    if len(rgbx) < width * height * 4:
+        return False
+    if np is not None:
+        return _photo_numpy(rgbx, width, height)
+    return _photo_python(rgbx, width, height)
+
+
+def _photo_numpy(rgbx: bytes | bytearray | memoryview, width: int, height: int) -> bool:
+    pix = np.frombuffer(rgbx, dtype=np.uint8)
+    frame = pix[: width * height * 4].reshape(height, width, 4)
+    step_y = max(1, height // 48)
+    step_x = max(1, width // 48)
+    sample = frame[::step_y, ::step_x, :3]
+    if sample.shape[0] < 2 or sample.shape[1] < 2:
+        return False
+    shifted = sample.astype(np.uint16) >> 3
+    quant = (shifted[:, :, 0] << 10) | (shifted[:, :, 1] << 5) | shifted[:, :, 2]
+    if int(np.unique(quant).size) < 32:
+        return False
+    diff = np.abs(sample[:, 1:, :].astype(np.int16) - sample[:, :-1, :].astype(np.int16)).sum(axis=2)
+    small = int(np.count_nonzero(diff < 48))
+    large = int(np.count_nonzero(diff > 160))
+    return small > large * 2
+
+
+def _photo_python(rgbx: bytes | bytearray | memoryview, width: int, height: int) -> bool:
+    step_y = max(1, height // 24)
+    step_x = max(1, width // 24)
+    mv = memoryview(rgbx)
+    colors: set[int] = set()
+    small = 0
+    large = 0
+    y = 0
+    while y < height:
+        x = 0
+        row = y * width * 4
+        while x + step_x < width:
+            i = row + x * 4
+            r, g, b = mv[i], mv[i + 1], mv[i + 2]
+            colors.add(((r >> 3) << 10) | ((g >> 3) << 5) | (b >> 3))
+            j = i + step_x * 4
+            dist = abs(mv[j] - r) + abs(mv[j + 1] - g) + abs(mv[j + 2] - b)
+            if dist < 48:
+                small += 1
+            elif dist > 160:
+                large += 1
+            x += step_x
+        y += step_y
+    return len(colors) >= 32 and small > large * 2
+
+
+_JPEG_BACKEND: str | None = None
+_TURBO = None
+_JPEG_WARNED = False
+
+
+def jpeg_backend() -> str | None:
+    """`simplejpeg`, `turbojpeg`, `pil`, or None when no encoder is installed."""
+    global _JPEG_BACKEND, _TURBO
+    if _JPEG_BACKEND is not None:
+        return _JPEG_BACKEND or None
+    if np is not None:
+        try:
+            import simplejpeg  # noqa: F401
+            _JPEG_BACKEND = "simplejpeg"
+            return _JPEG_BACKEND
+        except ImportError:
+            pass
+        try:
+            from turbojpeg import TurboJPEG
+            _TURBO = TurboJPEG()
+            _JPEG_BACKEND = "turbojpeg"
+            return _JPEG_BACKEND
+        except Exception:
+            _TURBO = None
+    try:
+        from PIL import Image  # noqa: F401
+        _JPEG_BACKEND = "pil"
+        return _JPEG_BACKEND
+    except ImportError:
+        _JPEG_BACKEND = ""
+        return None
+
+
+def _rgb_pixels(rgbx: bytes | bytearray | memoryview, width: int, height: int):
+    """Contiguous HxWx3 RGB. ndarray when numpy is present, else bytes."""
+    if np is not None:
+        pix = np.frombuffer(rgbx, dtype=np.uint8)
+        frame = pix[: width * height * 4].reshape(height, width, 4)
+        return np.ascontiguousarray(frame[:, :, :3])
+    return _pack_rgb(rgbx)
+
+
+def _encode_jpeg_rgb(rgb, width: int, height: int, quality: int) -> bytes | None:
+    global _JPEG_WARNED
+    backend = jpeg_backend()
+    if backend is None:
+        if not _JPEG_WARNED:
+            _JPEG_WARNED = True
+            log.info("Tight JPEG indisponível; instale pillow ou simplejpeg (o install.sh faz isso)")
+        return None
+    try:
+        if backend == "simplejpeg":
+            import simplejpeg
+            arr = rgb if np is not None and not isinstance(rgb, (bytes, bytearray)) else None
+            if arr is None:
+                return None
+            return simplejpeg.encode_jpeg(
+                arr, quality=quality, colorspace="RGB", colorsubsampling="420", fastdct=True,
+            )
+        if backend == "turbojpeg":
+            from turbojpeg import TJPF_RGB, TJSAMP_420
+            if _TURBO is None or isinstance(rgb, (bytes, bytearray)):
+                return None
+            return _TURBO.encode(rgb, quality=quality, pixel_format=TJPF_RGB, jpeg_subsample=TJSAMP_420)
+        from PIL import Image
+        if np is not None and not isinstance(rgb, (bytes, bytearray)):
+            image = Image.fromarray(rgb, "RGB")
+        else:
+            image = Image.frombytes("RGB", (width, height), bytes(rgb))
+        buf = io.BytesIO()
+        image.save(buf, format="JPEG", quality=quality, subsampling=2)
+        return buf.getvalue()
+    except Exception as exc:  # noqa: BLE001 — missing libjpeg should fall back to zlib
+        log.debug("jpeg %s: %s", backend, exc)
+        return None
+
+
+def _tight_jpeg(rgbx: bytes | bytearray | memoryview, width: int, height: int) -> bytes | None:
+    """Tight JPEG rectangle (control 0x90 + compact length + JPEG), or None."""
+    rgb = _rgb_pixels(rgbx, width, height)
+    best: bytes | None = None
+    for quality in (JPEG_QUALITY, 55, 40, 30):
+        blob = _encode_jpeg_rgb(rgb, width, height, quality)
+        if not blob or len(blob) < 4 or blob[:2] != b"\xff\xd8":
+            break
+        best = blob
+        if len(blob) <= JPEG_BYTE_BUDGET:
+            break
+    if not best or len(best) > 0x3FFFFF:
+        return None
+    return bytes((TIGHT_JPEG,)) + write_compact(len(best)) + best
+
+
+def encode_tight(
+    rgbx: bytes,
+    fmt: PixelFormat,
+    level: int = 1,
+    width: int = 0,
+    height: int = 0,
+) -> bytes:
     """One Tight rectangle payload (no x/y/w/h header)."""
     solid = solid_rgbx(rgbx)
     if solid is not None:
-        return bytes((0x08,)) + pack_tight(solid, fmt)
+        return bytes((TIGHT_FILL,)) + pack_tight(solid, fmt)
+    if (
+        width > 0 and height > 0 and width * height * 4 == len(rgbx)
+        and looks_photographic(rgbx, width, height)
+    ):
+        jpeg = _tight_jpeg(rgbx, width, height)
+        if jpeg is not None:
+            return jpeg
     pixels = pack_tight(rgbx, fmt)
-    # Bit 4 resets zlib stream 0. Low nibble 0 = basic compression, copy filter.
-    control = 0x10
+    # Bit 0 resets zlib stream 0. High nibble 0 = basic compression, copy filter.
+    control = TIGHT_BASIC_RESET
     if len(pixels) < TIGHT_MIN_COMPRESS:
         return bytes((control,)) + pixels
     compressed = zlib.compress(pixels, level)
@@ -322,20 +514,21 @@ def encode_tight(rgbx: bytes, fmt: PixelFormat, level: int = 1) -> bytes:
 
 
 def decode_tight(payload: bytes, width: int, height: int, fmt: PixelFormat) -> bytes:
-    """Inverse of `encode_tight` for the subset we emit (fill and copy filter)."""
+    """Inverse of `encode_tight` for fill and basic compression (not JPEG)."""
     if not payload:
         raise ValueError("empty tight payload")
-    control = payload[0]
-    low = control & 0x0F
+    comp = tight_subencoding(payload[0])
     offset = 1
     count = width * height
-    if low == 0x08:
+    if comp == 0x08:
         pix = payload[offset:offset + fmt.cpixel_bytes]
         one = _tight_triplet_to_rgbx(pix) if fmt.cpixel_bytes == 3 else cpixel_to_rgbx(pix, fmt)
         return one * count
-    if low in (0x09, 0x0A):
-        raise ValueError("JPEG/PNG tight is not produced")
-    if low & 0x04:
+    if comp == 0x09:
+        raise ValueError("JPEG tight is display-only")
+    if comp > 0x09:
+        raise ValueError(f"tight subencoding {comp}")
+    if comp & 0x04:
         offset += 1  # explicit filter id; we only emit copy (0) and usually omit it
     raw_len = count * fmt.cpixel_bytes
     if raw_len < TIGHT_MIN_COMPRESS:
@@ -433,7 +626,7 @@ def tight_slices(
     one rectangle; random noise does not.
     """
     try:
-        payload = encode_tight(rgbx, fmt, level=level)
+        payload = encode_tight(rgbx, fmt, level=level, width=width, height=height)
     except ValueError:
         if height <= 1:
             raise
@@ -456,7 +649,7 @@ def encode_rect(
     level: int = 1,
 ) -> tuple[int, bytes]:
     if encoding == ENCODING_TIGHT:
-        return ENCODING_TIGHT, encode_tight(rgbx, fmt, level=level)
+        return ENCODING_TIGHT, encode_tight(rgbx, fmt, level=level, width=width, height=height)
     if encoding == ENCODING_ZRLE:
         enc = zrle or ZrleEncoder(level)
         return ENCODING_ZRLE, enc.encode(rgbx, width, height, fmt)
@@ -467,9 +660,15 @@ def coalesce_rects(
     rects: list[tuple[int, int, int, int]],
     width: int,
     height: int,
-    max_rects: int = 8,
+    max_rects: int = 16,
 ) -> list[tuple[int, int, int, int]]:
-    """Merge exclusive-end damage rects. A large total area becomes one frame."""
+    """Merge exclusive-end damage rects.
+
+    Touching clips become one Tight rectangle. Extra clips are folded by the
+    pair that adds the least empty pixels. A large or numerous update is not
+    promoted to the whole framebuffer — that is what made every adb frame a
+    1920×1200 rectangle.
+    """
     norm: list[tuple[int, int, int, int]] = []
     for x1, y1, x2, y2 in rects:
         x1 = 0 if x1 < 0 else width if x1 > width else x1
@@ -480,18 +679,40 @@ def coalesce_rects(
             norm.append((x1, y1, x2, y2))
     if not norm:
         return []
-    area = sum((x2 - x1) * (y2 - y1) for x1, y1, x2, y2 in norm)
-    # Only a nearly full redraw becomes one rectangle. Half the desktop used
-    # to, and then every update was a 1920x1200 pack.
-    if area * 5 >= width * height * 4:
-        return [(0, 0, width, height)]
     merged = _merge_touching(norm)
-    if len(merged) > max_rects:
-        return [(
-            min(r[0] for r in merged), min(r[1] for r in merged),
-            max(r[2] for r in merged), max(r[3] for r in merged),
-        )]
+    if len(merged) > max(1, max_rects):
+        merged = _merge_to_limit(merged, max(1, max_rects))
     return merged
+
+
+def _rect_area(rect: tuple[int, int, int, int]) -> int:
+    return (rect[2] - rect[0]) * (rect[3] - rect[1])
+
+
+def _union(a: tuple[int, int, int, int], b: tuple[int, int, int, int]) -> tuple[int, int, int, int]:
+    return (min(a[0], b[0]), min(a[1], b[1]), max(a[2], b[2]), max(a[3], b[3]))
+
+
+def _merge_to_limit(
+    rects: list[tuple[int, int, int, int]],
+    limit: int,
+) -> list[tuple[int, int, int, int]]:
+    pending = list(rects)
+    while len(pending) > limit:
+        best_i = 0
+        best_j = 1
+        best_cost: int | None = None
+        best_union = pending[0]
+        for i in range(len(pending)):
+            for j in range(i + 1, len(pending)):
+                union = _union(pending[i], pending[j])
+                cost = _rect_area(union) - _rect_area(pending[i]) - _rect_area(pending[j])
+                if best_cost is None or cost < best_cost:
+                    best_cost = cost
+                    best_i, best_j, best_union = i, j, union
+        pending = [rect for k, rect in enumerate(pending) if k != best_i and k != best_j]
+        pending.append(best_union)
+    return pending
 
 
 def _touch(a: tuple[int, int, int, int], b: tuple[int, int, int, int]) -> bool:

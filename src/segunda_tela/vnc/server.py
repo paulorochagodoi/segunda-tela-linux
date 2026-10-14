@@ -2,8 +2,12 @@
 
 One listening socket per bind address (127.0.0.1, plus the tether IP when
 that path is the one in use). Clients authenticate with a VNC password.
-Updates are damage rectangles, Tight or ZRLE as the client prefers, capped
-at `fps` so a quiet desktop sends nothing and a busy one stays near the cap.
+Updates are the damage rectangles the grab reported, Tight or ZRLE as the
+client prefers. Output is capped at 30 fps even when the monitor is 60:
+a quiet desktop sends nothing, a busy one coalesces to that cap.
+
+Each client has a reader thread and a writer thread. `sendall` of a frame
+over adb blocks; the reader keeps parsing pointer events while that happens.
 """
 from __future__ import annotations
 
@@ -41,6 +45,15 @@ log = logging.getLogger(__name__)
 
 PointerFn = Callable[[int, int, int], None]
 _SERVER_VERSION = b"RFB 003.008\n"
+# adb cannot carry 60 full frames. The grab may still run at the monitor
+# rate; the socket is paced here.
+VNC_OUTPUT_FPS = 30
+JPEG_LOG_BYTES = 200 * 1024
+
+
+def output_interval(fps: int) -> float:
+    """Seconds between framebuffer updates. Never faster than `VNC_OUTPUT_FPS`."""
+    return 1.0 / min(VNC_OUTPUT_FPS, max(1, int(fps)))
 
 
 @dataclass
@@ -66,6 +79,7 @@ class _Client:
     next_send: float = 0.0
     alive: bool = True
     thread: Optional[threading.Thread] = None
+    writer: Optional[threading.Thread] = None
     updates: int = 0
     bytes_out: int = 0
 
@@ -106,7 +120,8 @@ class VncServer:
         self._stat_pointers = 0
         self._cursor: Optional[tuple[int, int]] = None
         self._logged_format = False
-        self._logged_pointer = False
+        self._last_buttons = -1
+        self._pointer_log_t = 0.0
         self.on_resize: Optional[Callable[[int, int], None]] = None
 
     # ----------------------------------------------------------------- lifecycle
@@ -250,40 +265,69 @@ class VncServer:
 
     # ----------------------------------------------------------------- protocol
     def _client_loop(self, client: _Client) -> None:
+        """Read client messages. Encoding and `sendall` run on `_writer_loop`."""
         sock = client.sock
         try:
             sock.settimeout(15)
             self._handshake(client)
             sock.settimeout(None)
+            client.writer = threading.Thread(
+                target=self._writer_loop, args=(client,), name=f"vnc-wr-{client.addr}", daemon=True,
+            )
+            client.writer.start()
             while client.alive and not self._stop.is_set():
                 if client.buf and not self._drain(client):
                     break
-                self._flush(client)
-                timeout = self._wait_timeout(client)
                 try:
-                    ready, _, _ = select.select([sock, client.wake_r], [], [], timeout)
+                    ready, _, _ = select.select([sock], [], [], 0.5)
                 except (OSError, ValueError):
                     break
-                if client.wake_r in ready:
-                    try:
-                        os.read(client.wake_r, 256)
-                    except OSError:
-                        break
-                if sock in ready:
-                    try:
-                        chunk = sock.recv(65536)
-                    except OSError:
-                        break
-                    if not chunk:
-                        break
-                    client.buf += chunk
-                    if not self._drain(client):
-                        break
-                self._flush(client)
+                if sock not in ready:
+                    continue
+                try:
+                    chunk = sock.recv(65536)
+                except OSError:
+                    break
+                if not chunk:
+                    break
+                client.buf += chunk
+                if not self._drain(client):
+                    break
         except (OSError, EOFError, ValueError) as exc:
             log.debug("VNC %s: %s", client.addr, exc)
         finally:
+            client.alive = False
+            self._wake(client)
+            try:
+                client.sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            writer = client.writer
+            if writer is not None and writer is not threading.current_thread():
+                writer.join(timeout=2)
             self._drop(client)
+
+    def _writer_loop(self, client: _Client) -> None:
+        while client.alive and not self._stop.is_set():
+            try:
+                self._flush(client)
+            except Exception as exc:  # noqa: BLE001 — a bad rect must not kill the reader
+                log.warning("VNC encode %s: %s", client.addr, exc)
+                client.alive = False
+                break
+            if not client.alive or self._stop.is_set():
+                break
+            timeout = self._wait_timeout(client)
+            try:
+                ready, _, _ = select.select([client.wake_r], [], [], timeout)
+            except (OSError, ValueError):
+                break
+            if not ready:
+                continue
+            try:
+                os.read(client.wake_r, 4096)
+            except OSError:
+                break
 
     def _recv(self, client: _Client, n: int) -> bytes:
         while len(client.buf) < n:
@@ -331,29 +375,32 @@ class VncServer:
         client.sock.sendall(body)
 
     def _drain(self, client: _Client) -> bool:
+        wake = False
         while client.buf and client.alive:
             kind = client.buf[0]
             if kind == 0:
                 if len(client.buf) < 20:
-                    return True
+                    break
                 raw = self._recv(client, 20)
-                client.fmt = parse_pixel_format(raw[4:20])
-                fmt = client.fmt
+                fmt = parse_pixel_format(raw[4:20])
+                with self._lock:
+                    client.fmt = fmt
                 log.info(
                     "VNC SetPixelFormat bpp=%s depth=%s big_endian=%s shifts r=%s g=%s b=%s",
                     fmt.bpp, fmt.depth, fmt.big_endian, fmt.red_shift, fmt.green_shift, fmt.blue_shift,
                 )
             elif kind == 2:
                 if len(client.buf) < 4:
-                    return True
+                    break
                 count = struct.unpack_from(">H", client.buf, 2)[0]
                 need = 4 + 4 * count
                 if len(client.buf) < need:
-                    return True
+                    break
                 raw = self._recv(client, need)
                 encs = list(struct.unpack(f">{count}i", raw[4:]))
-                client.encodings = encs
-                client.encoding = pick_encoding(encs)
+                with self._lock:
+                    client.encodings = encs
+                    client.encoding = pick_encoding(encs)
                 log.info("VNC encodings prefer %s (oferecidas %s)", client.encoding, encs[:8])
                 if ENCODING_CONTINUOUS in encs and not client.continuous:
                     # The enable message (150) is authoritative; listing it
@@ -362,39 +409,45 @@ class VncServer:
                     pass
             elif kind == 3:
                 if len(client.buf) < 10:
-                    return True
+                    break
                 raw = self._recv(client, 10)
                 _x, _y, _w, _h = struct.unpack_from(">HHHH", raw, 2)
-                client.incremental = bool(raw[1])
-                client.pending_requests = min(8, client.pending_requests + 1)
-                if not client.incremental:
-                    client.force_full = True
+                with self._lock:
+                    client.incremental = bool(raw[1])
+                    client.pending_requests = min(8, client.pending_requests + 1)
+                    if not client.incremental:
+                        client.force_full = True
+                wake = True
                 del _x, _y, _w, _h
             elif kind == 4:
                 if len(client.buf) < 8:
-                    return True
+                    break
                 self._recv(client, 8)  # key event: touch only
             elif kind == 5:
                 if len(client.buf) < 6:
-                    return True
+                    break
                 raw = self._recv(client, 6)
                 buttons, x, y = raw[1], struct.unpack_from(">H", raw, 2)[0], struct.unpack_from(">H", raw, 4)[0]
                 self._pointer(x, y, buttons)
             elif kind == 6:
                 if len(client.buf) < 8:
-                    return True
+                    break
                 length = struct.unpack_from(">I", client.buf, 4)[0]
                 if len(client.buf) < 8 + length:
-                    return True
+                    break
                 self._recv(client, 8 + length)
             elif kind == 150:
                 if len(client.buf) < 10:
-                    return True
+                    break
                 raw = self._recv(client, 10)
-                client.continuous = bool(raw[1])
+                with self._lock:
+                    client.continuous = bool(raw[1])
+                wake = True
             else:
                 log.warning("VNC mensagem desconhecida %s — fechando o cliente", kind)
                 return False
+        if wake:
+            self._wake(client)
         return True
 
     def _wait_timeout(self, client: _Client) -> float:
@@ -432,11 +485,15 @@ class VncServer:
         for client in wakes:
             self._wake(client)
         self._stat_pointers += 1
-        if not self._logged_pointer:
-            self._logged_pointer = True
-            log.info("VNC pointer x=%s y=%s buttons=%s (uinput se o toque abriu)", x, y, buttons)
-        else:
-            log.debug("VNC pointer x=%s y=%s buttons=%s", x, y, buttons)
+        now = time.monotonic()
+        changed = buttons != self._last_buttons
+        # Button edges always, motion at a few lines per second. The fps
+        # counter still includes every event, including ones that arrived
+        # while a frame was blocked in sendall.
+        if changed or now - self._pointer_log_t >= 0.25:
+            self._last_buttons = buttons
+            self._pointer_log_t = now
+            log.info("VNC pointer x=%s y=%s buttons=%s", x, y, buttons)
 
     def _wants_send(self, client: _Client) -> bool:
         if not (client.continuous or client.pending_requests):
@@ -446,11 +503,12 @@ class VncServer:
     def _flush(self, client: _Client) -> None:
         if not client.alive:
             return
-        now = time.monotonic()
-        if now < client.next_send and not client.force_full:
-            return
+        interval = output_interval(self.fps)
         with self._lock:
-            if not (client.continuous or client.pending_requests):
+            if not client.alive or not (client.continuous or client.pending_requests):
+                return
+            now = time.monotonic()
+            if now < client.next_send and not client.force_full:
                 return
             width, height = self.w, self.h
             cursor = self._cursor
@@ -519,9 +577,22 @@ class VncServer:
         client.updates += 1
         client.bytes_out += len(msg)
         encode_s = time.perf_counter() - t0
-        if encode_s >= 0.05:
-            log.info("VNC encode %.0f ms, %d rects, %d KB", encode_s * 1000, len(pieces), len(msg) // 1024)
-        client.next_send = time.monotonic() + 1.0 / self.fps
+        px = sum(w * h for _x, _y, w, h, _enc, _payload in pieces)
+        jpeg = any(payload[:1] == b"\x90" for _x, _y, _w, _h, _enc, payload in pieces)
+        shown = pieces[:4]
+        boxes = " ".join(f"{w}x{h}@{x},{y}" for x, y, w, h, _enc, _payload in shown)
+        if len(pieces) > len(shown):
+            boxes += f" +{len(pieces) - len(shown)}"
+        if encode_s >= 0.03 or len(msg) >= JPEG_LOG_BYTES:
+            log.info(
+                "VNC encode %.0f ms, %d rects, %d px, %d KB%s [%s]",
+                encode_s * 1000, len(pieces), px, max(0, len(msg) // 1024),
+                " jpeg" if jpeg else "", boxes,
+            )
+        # A frame that already used the interval is not delayed again.
+        # That keeps a 40 ms encode near 25 fps instead of 30-then-wait.
+        remain = interval - encode_s
+        client.next_send = time.monotonic() + remain if remain > 0 else time.monotonic()
         self._stat_updates += 1
         self._stat_bytes += len(msg)
         self._log_fps()

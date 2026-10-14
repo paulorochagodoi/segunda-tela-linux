@@ -13,7 +13,7 @@ import time
 import pytest
 
 from segunda_tela.cli import build_parser, main
-from segunda_tela.display.evdi import EvdiError, EvdiMonitor, ShadowFrames
+from segunda_tela.display.evdi import EvdiError, EvdiMonitor, ShadowFrames, _cap_damage
 from segunda_tela.display.randr import Output
 from segunda_tela.usb.adb import Adb
 from segunda_tela.vnc.auth import des_encrypt_block, random_vnc_password, vnc_key, vnc_response
@@ -30,6 +30,7 @@ from segunda_tela.vnc.encode import (
     encode_rect,
     encode_tight,
     pack_cpixels,
+    read_compact,
     tight_slices,
     parse_pixel_format,
     pick_encoding,
@@ -57,7 +58,7 @@ from segunda_tela.vnc.layout import (
     upsert_touch_map,
 )
 from segunda_tela.vnc.link import VncLinkError, bvnc_shell, bvnc_uri, launch_bvnc, listen_plan, prepare_vnc_transport
-from segunda_tela.vnc.server import VncServer
+from segunda_tela.vnc.server import VncServer, output_interval
 from segunda_tela.vnc.wayvnc import EXT_IMAGE_COPY, WLR_SCREENCOPY, WLR_VIRTUAL_POINTER, assess_wayvnc, parse_version
 
 
@@ -111,7 +112,8 @@ def test_tight_solid_and_pattern_roundtrip_bvnc_format():
     red = _rgbx(8, 6, bytes((255, 0, 0, 255)))
     wire = encode_tight(red, fmt)
     # bVNC Tight paints byte0 as red. A shift-based CPIXEL would be 0,0,255.
-    assert wire[:4] == bytes((0x08, 255, 0, 0))
+    # 0x80: fill in the high nibble. bVNC shifts the low 4 reset bits off first.
+    assert wire[:4] == bytes((0x80, 255, 0, 0))
     back = decode_tight(wire, 8, 6, fmt)
     assert back == red
     mixed = bytearray(red)
@@ -170,6 +172,15 @@ def test_solid_detector_and_coalesce():
     small = coalesce_rects([(1, 1, 2, 2), (4, 4, 5, 5)], 100, 100)
     assert (1, 1, 2, 2) in small and (4, 4, 5, 5) in small
     assert coalesce_rects([], 10, 10) == []
+    # A tall partial update used to become the whole 1920x1200 framebuffer.
+    assert coalesce_rects([(0, 0, 1920, 1100)], 1920, 1200) == [(0, 0, 1920, 1100)]
+    scattered = [(i * 10, 0, i * 10 + 2, 2) for i in range(20)]
+    folded = coalesce_rects(scattered, 1920, 1200, max_rects=16)
+    assert 1 < len(folded) <= 16
+    assert (0, 0, 1920, 1200) not in folded
+    capped = _cap_damage(scattered, 1920, 1200)
+    assert len(capped) <= 16
+    assert (0, 0, 1920, 1200) not in capped
 
 
 def test_damage_tight_holds_30fps_for_a_window():
@@ -199,8 +210,47 @@ def test_full_frame_tight_pack_stays_interactive():
     t0 = time.perf_counter()
     slices = tight_slices(arr.tobytes(), w, h, fmt)
     elapsed = time.perf_counter() - t0
-    assert slices and all(payload[0] in (0x08, 0x10) for *_box, payload in slices)
+    assert slices and all(payload[0] in (0x80, 0x01, 0x90) for *_box, payload in slices)
     assert elapsed < 0.5, f"full-frame Tight took {elapsed:.3f}s"
+
+
+def test_photo_region_is_jpeg_and_flat_ui_stays_zlib():
+    """bVNC reads JPEG only when the control byte's high nibble is 0x9."""
+    pytest.importorskip("numpy")
+    fmt = PixelFormat.bvnc()
+    w, h = 320, 240
+    buf = bytearray(w * h * 4)
+    for y in range(h):
+        row = y * w * 4
+        for x in range(w):
+            i = row + x * 4
+            buf[i] = (x * 255) // (w - 1)
+            buf[i + 1] = (y * 255) // (h - 1)
+            buf[i + 2] = 40
+            buf[i + 3] = 255
+    payload = encode_tight(bytes(buf), fmt, width=w, height=h)
+    assert payload[0] == 0x90
+    length, offset = read_compact(payload, 1)
+    assert payload[offset:offset + 2] == b"\xff\xd8"
+    assert length == len(payload) - offset
+    assert length < 200 * 1024
+    assert length < w * h  # well under raw RGB
+
+    ui = bytearray(w * h * 4)
+    for y in range(h):
+        for x in range(w):
+            on = ((x // 8) + (y // 8)) & 1
+            ui[(y * w + x) * 4:(y * w + x) * 4 + 4] = (
+                bytes((255, 255, 255, 255)) if on else bytes((0, 0, 0, 255))
+            )
+    flat = encode_tight(bytes(ui), fmt, width=w, height=h)
+    assert flat[0] == 0x01
+
+
+def test_vnc_output_is_capped_at_30fps():
+    assert output_interval(60) == pytest.approx(1 / 30)
+    assert output_interval(10) == pytest.approx(0.1)
+    assert output_interval(1) == pytest.approx(1.0)
 
 
 # ------------------------------------------------------------------- wayvnc decision
@@ -496,6 +546,34 @@ def test_rfb_serves_only_damaged_rgbx_and_rejects_a_bad_password():
         sock2.close()
     finally:
         server.stop()
+
+    blocked = VncServer(
+        "s3cret99", 960, 540, ["127.0.0.1"], port=0, fps=60,
+        challenge_fn=lambda n: b"\x33" * n,
+    )
+    blocked.start()
+    try:
+        sock, bw, bh = _handshake(blocked.port, "s3cret99")
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4096)
+        deadline = time.monotonic() + 2
+        client = None
+        while time.monotonic() < deadline and client is None:
+            with blocked._lock:
+                if blocked._clients:
+                    client = blocked._clients[0]
+            time.sleep(0.01)
+        assert client is not None
+        client.sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 4096)
+        _request(sock, 0, bw, bh)  # non-incremental raw frame, large enough to fill the window
+        time.sleep(0.05)
+        sock.sendall(struct.pack(">BBHH", 5, 1, 12, 13))
+        seen = time.monotonic() + 1.0
+        while time.monotonic() < seen and blocked._stat_pointers < 1:
+            time.sleep(0.01)
+        assert blocked._stat_pointers >= 1
+        sock.close()
+    finally:
+        blocked.stop()
 
     bad = VncServer("s3cret99", 8, 8, ["127.0.0.1"], port=0, challenge_fn=lambda n: b"\x22" * n)
     bad.start()

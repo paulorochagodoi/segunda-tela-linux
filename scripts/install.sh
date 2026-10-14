@@ -22,7 +22,12 @@ if [[ -d "$ROOT/.venv" ]]; then
 fi
 python3 -m venv --system-site-packages "$ROOT/.venv"
 "$ROOT/.venv/bin/pip" install -U pip
-"$ROOT/.venv/bin/pip" install -e "$ROOT"
+# --usb-vnc: numpy packs RGBx; Pillow encodes Tight JPEG. simplejpeg is faster
+# when the wheel installs; Pillow covers the same path if it does not.
+"$ROOT/.venv/bin/pip" install -e "$ROOT" "numpy>=1.24" "pillow>=10"
+if ! "$ROOT/.venv/bin/pip" install "simplejpeg>=1.6"; then
+  echo "AVISO: simplejpeg ausente; o JPEG do --usb-vnc usa Pillow."
+fi
 
 if ! "$ROOT/.venv/bin/python" -c "import gi; gi.require_version('Gtk','4.0'); gi.require_version('Adw','1'); from gi.repository import Gtk, Adw" 2>/dev/null; then
   cat <<'MSG'
