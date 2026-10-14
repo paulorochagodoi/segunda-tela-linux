@@ -26,6 +26,8 @@ def test_evdi_modes():
     assert evdi_modes(1920, 1200, 60) == [(1920, 1200, 60), (2560, 1600, 60), (1920, 1080, 60)]
     assert evdi_modes(2560, 1600, 30)[0] == (2560, 1600, 30)
     assert len(evdi_modes(2560, 1600, 60)) == 3
+    # --resolution 1080 must not also advertise 1920x1200, or the compositor picks it.
+    assert evdi_modes(1920, 1080, 30, locked=True) == [(1920, 1080, 30)]
 
 
 def test_evdi_sysfs_scan(tmp_path: Path):

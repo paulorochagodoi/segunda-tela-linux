@@ -581,6 +581,7 @@ class WfdRtspServer(socketserver.ThreadingTCPServer):
         encoder: str = "auto",
         probe_hdcp: bool = False,
         gnd_compat: bool = False,
+        force_1080p30: bool = False,
         m1_delay_s: float = 0.5,
         keepalive_s: float = KEEPALIVE_S,
     ) -> None:
@@ -603,6 +604,9 @@ class WfdRtspServer(socketserver.ThreadingTCPServer):
         # Literal gnome-network-displays resolution (hardcoded 1920x1080p30).
         # The RTSP bytes and encoder graph already follow that project either way.
         self.gnd_compat = gnd_compat
+        # --resolution 1080: 1920x1080p30 and SPS level 4.0, even when the
+        # sink's level byte is only 3.1. GND sends this mode to the Tab S10 FE.
+        self.force_1080p30 = force_1080p30
         self.m1_delay_s = m1_delay_s
         self.keepalive_s = keepalive_s
         # RTP destination for sinks that reach us via loopback (`adb reverse`):
@@ -618,7 +622,8 @@ class WfdRtspServer(socketserver.ThreadingTCPServer):
         # show; it wins only if the sink's wfd_video_formats lists it.
         want = self.want_size or ((self.width, self.height) if self.width and self.height else None)
         return negotiate(sink, want=want, max_fps=self.max_fps, max_pixels=self.max_pixels,
-                         audio=self.audio, encoder=self.encoder, gnd_compat=self.gnd_compat)
+                         audio=self.audio, encoder=self.encoder, gnd_compat=self.gnd_compat,
+                         force_1080p30=self.force_1080p30)
 
     def _register(self, h: _Handler) -> None:
         with self._hlock:

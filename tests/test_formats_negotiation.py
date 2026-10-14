@@ -86,6 +86,11 @@ def test_select_stays_inside_level_31():
     assert (gnd.width, gnd.height, gnd.fps) == (1920, 1080, 30)
     assert glevel == H264_LEVEL_31 and gprofile == 1
     assert "gnome-network-displays" in greason
+    forced, flevel, fprofile, freason = select_video(caps, force_1080p30=True)
+    assert (forced.width, forced.height, forced.fps) == (1920, 1080, 30)
+    assert forced.index == 7
+    assert flevel == H264_LEVEL_31 and fprofile == 1
+    assert "1920x1080p30" in freason
 
 
 def test_largest_mode_beats_a_smaller_native():
@@ -94,6 +99,31 @@ def test_largest_mode_beats_a_smaller_native():
     assert caps.native_mode.width == 1680
     mode, _, _, _ = select_video(caps)
     assert (mode.width, mode.height, mode.fps) == (1920, 1080, 60)
+
+
+def test_force_1080p30_uses_level_40_and_keeps_the_sink_m4_byte():
+    # Tab S10 FE: level byte 0x01 is only 3.1, but 1080p30 plays when the SPS is 4.0.
+    caps = parse_sink_caps(
+        "wfd_video_formats: 00 00 01 01 0001bde1 00300000 000003c0 00 0000 0000 0f none none\r\n"
+        "wfd_audio_codecs: AAC 00000001 00\r\n"
+    )
+    plain = negotiate(caps)
+    assert (plain.mode.width, plain.mode.height, plain.mode.fps) == (1280, 720, 30)
+    assert plain.level_idc == 31 and plain.level == 0x01
+
+    forced = negotiate(caps, force_1080p30=True)
+    assert (forced.mode.width, forced.mode.height, forced.mode.fps) == (1920, 1080, 30)
+    assert forced.mode.index == 7
+    assert forced.level == 0x01  # M4 still echoes the sink bitmap
+    assert forced.level_idc == 40
+    desc = m4_video_descriptor(forced.mode, forced.level, forced.profile)
+    assert "00000080" in desc and " 01 " in f" {desc} "
+
+    gnd = negotiate(caps, gnd_compat=True)
+    assert (gnd.mode.width, gnd.mode.height, gnd.mode.fps) == (1920, 1080, 30)
+    assert gnd.level_idc is None
+    both = negotiate(caps, gnd_compat=True, force_1080p30=True)
+    assert both.level_idc == 40
 
 
 def test_m4_descriptor_single_bit():

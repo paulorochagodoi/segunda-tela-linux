@@ -197,6 +197,57 @@ class ShadowFrames:
         self.reading = None
 
 
+class GrabClock:
+    """One EVDI update in flight, grabbed on a fixed period.
+
+    The old loop requested an update, waited out the ioctl, then `select`ed
+    for another full frame. A 10 ms grab on top of a 33 ms wait is 43 ms,
+    which is the steady 23.3 fps the tablet showed. The next request is
+    issued as soon as the grab returns (one frame ahead) and the following
+    grab stays on the original period, so that ioctl time sits inside the
+    frame instead of after it.
+    """
+
+    def __init__(self, now: float, fps: int = 30) -> None:
+        self.interval = 1.0 / max(1, fps)
+        self.next_slot = now
+        self.phase = "idle"  # idle | pending | ready
+
+    def set_fps(self, fps: int) -> None:
+        self.interval = 1.0 / max(1, fps)
+
+    def want_request(self, now: float) -> bool:
+        return self.phase == "idle" and now + 1e-6 >= self.next_slot - self.interval
+
+    def requested(self, immediate: bool) -> None:
+        self.phase = "ready" if immediate else "pending"
+
+    def update_ready(self) -> None:
+        if self.phase == "pending":
+            self.phase = "ready"
+
+    def want_grab(self, now: float) -> bool:
+        return self.phase == "ready" and now + 1e-6 >= self.next_slot
+
+    def grabbed(self, now: float) -> None:
+        self.phase = "idle"
+        self.next_slot += self.interval
+        if self.next_slot < now:
+            behind = now - self.next_slot
+            self.next_slot += (int(behind / self.interval) + 1) * self.interval
+
+    def timeout(self, now: float) -> float:
+        if self.phase == "ready":
+            wait = self.next_slot - now
+        elif self.phase == "idle":
+            wait = self.next_slot - self.interval - now
+        else:
+            wait = self.interval
+        if wait < 0.0:
+            wait = 0.0
+        return min(wait, 0.05)
+
+
 def module_loaded(sys_root: Path = Path("/sys")) -> bool:
     return (sys_root / "module" / "evdi").exists()
 
@@ -275,9 +326,15 @@ class EvdiMonitor:
         self._rects = (EvdiRect * MAX_DIRTY_RECTS)()
         self._buf_id = 1
         self._pending = False
+        self._clock = GrabClock(time.monotonic(), self.fps)
         self._stat_t0 = time.monotonic()
         self._stat_grabs = 0
         self._stat_frames = 0
+        self._stat_requests = 0
+        self._stat_immediate = 0
+        self._stat_req_s = 0.0
+        self._stat_grab_s = 0.0
+        self._stat_blit_s = 0.0
         self._ctx = EvdiEventContext(
             dpms_handler=_DPMS_CB(self._on_dpms),
             mode_changed_handler=_MODE_CB(self._on_mode),
@@ -390,8 +447,10 @@ class EvdiMonitor:
                 log.warning("mode change callback: %s", exc)
 
     def _on_update_ready(self, _buffer_id: int, _ud) -> None:
+        # The loop grabs on the frame slot. Grabbing here would add the
+        # ioctl on top of the period (the 23.3 fps bug).
         self._pending = False
-        self._grab_now()
+        self._clock.update_ready()
 
     # -------------------------------------------------------------- internals
     def _register_buffer(self, width: int, height: int) -> None:
@@ -418,66 +477,197 @@ class EvdiMonitor:
         if not (self._lib and self._handle and self._buf_desc is not None and self._buf is not None):
             return
         n = ctypes.c_int(0)
+        t0 = time.monotonic()
         # The ioctl copies only dirty rectangles into the registered buffer.
         self._lib.evdi_grab_pixels(self._handle, self._rects, ctypes.byref(n))
+        grab_s = time.monotonic() - t0
         count = max(0, int(n.value))
         rects = [
             (int(self._rects[i].x1), int(self._rects[i].y1), int(self._rects[i].x2), int(self._rects[i].y2))
             for i in range(min(count, MAX_DIRTY_RECTS))
         ]
+        t1 = time.monotonic()
         with self._frame_lock:
             self._stat_grabs += 1
+            self._stat_grab_s += grab_s
             if self._slots is not None and self._slots.apply(memoryview(self._buf), rects):
                 self._frame_seq = self._slots.seq
                 self._stat_frames += 1
                 self._frame_lock.notify_all()
+            self._stat_blit_s += time.monotonic() - t1
             self._log_grab_fps()
 
     def _log_grab_fps(self) -> None:
         now = time.monotonic()
         dt = now - self._stat_t0
-        if dt < 5.0:
+        if dt < 5.0 or self._stat_grabs <= 0:
             return
+        req_n = max(1, self._stat_requests)
         log.info(
-            "EVDI grab fps %.1f (%d grabs, %d updated frames in %.1fs, fourcc=%s, format=%s)",
-            self._stat_grabs / dt, self._stat_grabs, self._stat_frames, dt,
-            fourcc_str(self.pixel_format), EVDI_RAW_FORMAT,
+            "EVDI grab fps %.1f (request %.2fms x%d, grab_pixels %.2fms x%d, blit %.2fms, "
+            "updated %d, immediate %d, fourcc=%s)",
+            self._stat_grabs / dt,
+            1000.0 * self._stat_req_s / req_n, self._stat_requests,
+            1000.0 * self._stat_grab_s / self._stat_grabs, self._stat_grabs,
+            1000.0 * self._stat_blit_s / self._stat_grabs,
+            self._stat_frames, self._stat_immediate, fourcc_str(self.pixel_format),
         )
         self._stat_grabs = 0
         self._stat_frames = 0
+        self._stat_requests = 0
+        self._stat_immediate = 0
+        self._stat_req_s = 0.0
+        self._stat_grab_s = 0.0
+        self._stat_blit_s = 0.0
         self._stat_t0 = now
 
     def _loop(self) -> None:
         assert self._lib and self._handle
         fd = self._lib.evdi_get_event_ready(self._handle)
-        next_req = 0.0
+        self._clock = GrabClock(time.monotonic(), self.fps)
         while self._running:
-            # Read each iteration so PLAY can drop 60 Hz grabbing to the
-            # negotiated 30 Hz without restarting the event thread.
-            interval = 1.0 / max(1, self.fps)
+            # PLAY drops grabbing from the EDID rate to the negotiated rate
+            # without restarting this thread.
+            self._clock.set_fps(self.fps)
             if self.grab and self._buf_desc is None and self.mode is not None:
                 self._register_buffer(self.mode[0], self.mode[1])
             now = time.monotonic()
-            if self.grab and self._buf_desc is not None and not self._pending and now >= next_req:
-                next_req = now + interval
-                if self._lib.evdi_request_update(self._handle, self._buf_id):
-                    self._grab_now()
-                else:
-                    self._pending = True
+            if self.grab and self._buf_desc is not None and self._clock.want_request(now):
+                t0 = time.monotonic()
+                immediate = bool(self._lib.evdi_request_update(self._handle, self._buf_id))
+                self._stat_req_s += time.monotonic() - t0
+                self._stat_requests += 1
+                if immediate:
+                    self._stat_immediate += 1
+                self._pending = not immediate
+                self._clock.requested(immediate)
+                now = time.monotonic()
+            if self.grab and self._buf_desc is not None and self._clock.want_grab(now):
+                self._grab_now()
+                self._clock.grabbed(time.monotonic())
             try:
-                ready, _, _ = select.select([fd], [], [], min(interval, 0.1))
+                ready, _, _ = select.select([fd], [], [], self._clock.timeout(time.monotonic()))
             except (OSError, ValueError):
                 break
             if ready:
                 self._lib.evdi_handle_events(self._handle, ctypes.byref(self._ctx))
 
 
-class EvdiFrameFeeder:
-    """Writes the latest EVDI frame (RGBx) to a pipe at a fixed rate.
+def copy_frame_buffer(data: bytes | bytearray | memoryview, pts: int, duration: int):
+    """One copy of `data` into a Gst.Buffer. Repeats share this memory."""
+    from gi.repository import Gst
 
-    The bytes are the shadow the monitor just published — no per-frame
-    `bytes()` copy. Release the shadow after the write so the next grab can
-    reuse it.
+    raw = data if isinstance(data, (bytes, bytearray)) else bytes(data)
+    buf = Gst.Buffer.new_allocate(None, len(raw), None)
+    buf.fill(0, raw)
+    buf.pts = pts
+    buf.duration = duration
+    return buf
+
+
+def repeat_frame_buffer(src, pts: int, duration: int):
+    """New buffer, same pixels. No memcpy — the memory is shared."""
+    from gi.repository import Gst
+
+    out = Gst.Buffer.new()
+    for index in range(src.n_memory()):
+        mem = src.peek_memory(index)
+        out.append_memory(mem.share(0, mem.size))
+    out.pts = pts
+    out.duration = duration
+    return out
+
+
+class EvdiAppsrcPusher:
+    """Push EVDI frames into an in-process appsrc at a fixed rate.
+
+    A changed frame is copied once into a Gst.Buffer. An unchanged slot
+    shares that memory and only gets a new timestamp, so a static desktop
+    does not memcpy or write a full frame 30 times a second. The pipe path
+    (`EvdiFrameFeeder`) is the fallback when GStreamer is not in-process.
+    """
+
+    def __init__(self, monitor: EvdiMonitor, width: int, height: int, fps: int) -> None:
+        self.monitor = monitor
+        self.frame_size = width * height * 4
+        self.fps = max(1, fps)
+        self.copies = 0
+        self.repeats = 0
+        self._stop = threading.Event()
+
+    def __call__(self, appsrc) -> None:
+        from gi.repository import Gst
+
+        duration = Gst.SECOND // self.fps
+        interval = 1.0 / self.fps
+        pts = 0
+        seq = 0
+        last = None
+        blank = bytes(self.frame_size)
+        next_t = time.monotonic()
+        sent = 0
+        win_copies = win_repeats = 0
+        copy_s = push_s = 0.0
+        window = next_t
+        try:
+            while not self._stop.is_set():
+                now = time.monotonic()
+                timeout = max(0.0, next_t - now)
+                prev = seq
+                seq, frame = self.monitor.wait_frame(seq, timeout)
+                try:
+                    changed = seq != prev and frame is not None and len(frame) == self.frame_size
+                    t0 = time.monotonic()
+                    if changed or last is None:
+                        last = copy_frame_buffer(frame if changed else blank, pts, duration)
+                        copy_s += time.monotonic() - t0
+                        self.copies += 1
+                        win_copies += 1
+                        out = last
+                    else:
+                        self.repeats += 1
+                        win_repeats += 1
+                        out = repeat_frame_buffer(last, pts, duration)
+                    t1 = time.monotonic()
+                    ret = appsrc.emit("push-buffer", out)
+                    push_s += time.monotonic() - t1
+                    if ret == Gst.FlowReturn.FLUSHING or ret == Gst.FlowReturn.EOS:
+                        break
+                finally:
+                    release = getattr(self.monitor, "release_frame", None)
+                    if release is not None:
+                        release()
+                pts += duration
+                sent += 1
+                next_t += interval
+                now = time.monotonic()
+                if now - window >= 5.0:
+                    log.info(
+                        "EVDI feed fps %.1f (copy %.2fms x%d, push %.2fms x%d, repeats %d)",
+                        sent / (now - window),
+                        1000.0 * copy_s / max(1, win_copies), win_copies,
+                        1000.0 * push_s / max(1, sent), sent, win_repeats,
+                    )
+                    sent = 0
+                    win_copies = win_repeats = 0
+                    copy_s = push_s = 0.0
+                    window = now
+                if now > next_t + interval:
+                    next_t = now
+                elif next_t > now:
+                    time.sleep(next_t - now)
+        except (ValueError, OSError) as exc:
+            log.info("EVDI appsrc pusher stopped: %s", exc)
+
+    def stop(self) -> None:
+        self._stop.set()
+
+
+class EvdiFrameFeeder:
+    """Pipe fallback: write RGBx frames to fdsrc when appsrc is not in-process.
+
+    Unchanged frames still cross the pipe; the appsrc pusher is what skips
+    that copy. Release the shadow after the write so the next grab can reuse it.
     """
 
     def __init__(self, monitor: EvdiMonitor, width: int, height: int, fps: int) -> None:

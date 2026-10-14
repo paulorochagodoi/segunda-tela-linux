@@ -534,12 +534,17 @@ def _pick_video(
     max_pixels: int = 1920 * 1200,
     allow_chp: bool = True,
     gnd_compat: bool = False,
+    force_1080p30: bool = False,
 ) -> tuple[VideoMode, Optional[H264Codec], str]:
     if caps is None or not caps.codecs:
         return FALLBACK_MODE, None, "sink sent no video caps; 1080p30 fallback"
     codec = _prefer_codec(caps.codecs, allow_chp=allow_chp)
     if codec is None:
         return FALLBACK_MODE, None, "no usable H.264 profile; 1080p30 fallback"
+    if force_1080p30:
+        # The Tab S10 FE advertises only level 3.1, which excludes 1080p.
+        # gnome-network-displays still sends 1920x1080p30 and the tablet plays it.
+        return FALLBACK_MODE, codec, "forced 1920x1080p30 (--resolution 1080)"
     if gnd_compat:
         # wfd_client_select_codec_and_resolution compiles the native-resolution
         # search out (#if 0) and always falls back to 1920x1080p30.
@@ -581,6 +586,7 @@ def select_video(
     target_aspect: Optional[float] = None,
     allow_chp: bool = True,
     gnd_compat: bool = False,
+    force_1080p30: bool = False,
 ) -> tuple[VideoMode, int, int, str]:
     """Pick (mode, m4_level_byte, profile, reason).
 
@@ -594,7 +600,9 @@ def select_video(
     count and frame rate decide.
     """
     del target_aspect  # kept so existing callers do not break
-    mode, codec, reason = _pick_video(caps, want, max_fps, max_pixels, allow_chp, gnd_compat)
+    mode, codec, reason = _pick_video(
+        caps, want, max_fps, max_pixels, allow_chp, gnd_compat, force_1080p30,
+    )
     if codec is None:
         return mode, h264_level_for(mode.width, mode.height, mode.fps), H264_PROFILE_CBP, reason
     return mode, codec.level, _profile_of(codec, allow_chp=allow_chp), reason
@@ -624,11 +632,13 @@ def negotiate(
     audio: bool = True,
     encoder: str = "auto",
     gnd_compat: bool = False,
+    force_1080p30: bool = False,
 ) -> Negotiated:
     del target_aspect
     allow_chp = encoder != "openh264enc"
     mode, codec, reason = _pick_video(
         sink.video, want, max_fps, max_pixels, allow_chp=allow_chp, gnd_compat=gnd_compat,
+        force_1080p30=force_1080p30,
     )
     if codec is None:
         level, profile = h264_level_for(mode.width, mode.height, mode.fps), H264_PROFILE_CBP
@@ -637,8 +647,13 @@ def negotiate(
         level, profile = codec.level, _profile_of(codec, allow_chp=allow_chp)
         latency, min_slice, frame_rate = codec.latency, codec.min_slice_size, codec.frame_rate_control
     # The literal GND path never writes an SPS level. Otherwise the SPS level
-    # is exactly the one bit this mode needs (3.1 for 720p30).
-    stream_level = 0 if gnd_compat else h264_level_for(mode.width, mode.height, mode.fps)
+    # is exactly the one bit this mode needs (3.1 for 720p30, 4.0 for 1080p30).
+    # `--resolution 1080` forces that mode and still writes level 4.0, even
+    # when the sink's level byte is only 3.1. M4 keeps echoing the sink byte.
+    if gnd_compat and not force_1080p30:
+        stream_level = 0
+    else:
+        stream_level = h264_level_for(mode.width, mode.height, mode.fps)
     audio_desc = select_audio(sink) if audio else None
     return Negotiated(
         mode=mode, level=level, profile=profile, audio=audio_desc, reason=reason,

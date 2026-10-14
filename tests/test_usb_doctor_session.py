@@ -43,14 +43,14 @@ def test_usb_session_uses_extend_display_path(monkeypatch):
 
     seen = {}
 
-    def fake_create(w, h, mode, fps, capture="auto"):
-        seen.update(mode=mode, capture=capture)
+    def fake_create(w, h, mode, fps, capture="auto", lock_mode=False):
+        seen.update(mode=mode, capture=capture, lock_mode=lock_mode)
         return VirtualDisplay(w, h, mode, backend="evdi-grab")
 
     monkeypatch.setattr(sess, "create_virtual_display", fake_create)
     s = sess.SecondScreenSession(mode="extend", usb_link=UsbLink(transport="ncm", local_ip="10.108.120.2"),
                                  encoder="x264enc")
     s.prepare_display()
-    assert seen == {"mode": "extend", "capture": "auto"}
+    assert seen == {"mode": "extend", "capture": "auto", "lock_mode": False}
     assert s.advertise_ip == "10.108.120.2"
     assert not [n for n in s.notes if "espelhamento" in n]

@@ -99,6 +99,133 @@ def test_shadow_view_roundtrips_through_a_pipe():
     os.close(write_fd)
 
 
+def test_grab_clock_keeps_30_when_the_ioctl_takes_10ms():
+    """A 10 ms grab must sit inside the 33 ms slot, not after it (that was 23.3 fps)."""
+    from segunda_tela.display.evdi import GrabClock
+
+    clock = GrabClock(0.0, 30)
+    now = 0.0
+    grabs: list[float] = []
+    pending_at: float | None = None
+    while now < 1.2 and len(grabs) < 40:
+        if clock.want_request(now):
+            clock.requested(False)
+            pending_at = now + 0.005
+        if clock.want_grab(now):
+            grabs.append(now)
+            now += 0.010
+            clock.grabbed(now)
+            continue
+        wait = clock.timeout(now)
+        if clock.phase == "pending" and pending_at is not None and now + wait >= pending_at:
+            now = pending_at
+            clock.update_ready()
+            pending_at = None
+        else:
+            now += wait if wait > 0 else 1e-4
+    in_one = [t for t in grabs if t <= 1.0]
+    assert 28 <= len(in_one) <= 32
+    gaps = [b - a for a, b in zip(grabs, grabs[1:])]
+    assert gaps
+    assert abs(sum(gaps) / len(gaps) - (1.0 / 30)) < 0.002
+
+
+def test_grab_clock_skips_a_slot_instead_of_bursting():
+    from segunda_tela.display.evdi import GrabClock
+
+    clock = GrabClock(0.0, 30)
+    assert clock.want_request(0.0)
+    clock.requested(True)
+    assert clock.want_grab(0.0)
+    clock.grabbed(0.040)  # ioctl ran past the next slot
+    assert clock.phase == "idle"
+    assert clock.next_slot == pytest.approx(2 / 30)
+    assert not clock.want_grab(0.040)
+    assert clock.want_request(0.040)
+    clock.requested(True)
+    assert not clock.want_grab(0.050)
+    assert clock.want_grab(2 / 30)
+
+
+def test_appsrc_repeats_share_memory_when_the_frame_does_not_change():
+    gi = pytest.importorskip("gi")
+    gi.require_version("Gst", "1.0")
+    from gi.repository import Gst
+
+    from segunda_tela.display.evdi import EvdiAppsrcPusher
+
+    Gst.init(None)
+
+    class _Monitor:
+        def __init__(self) -> None:
+            self.seq = 0
+            self.buf = bytes((255, 0, 0, 255))
+            self.released = 0
+
+        def wait_frame(self, after_seq: int, timeout: float):
+            del timeout
+            if self.seq == 0:
+                self.seq = 1
+            return self.seq, self.buf
+
+        def release_frame(self) -> None:
+            self.released += 1
+
+    class _Appsrc:
+        def __init__(self) -> None:
+            self.bufs = []
+
+        def emit(self, name, buf):
+            assert name == "push-buffer"
+            self.bufs.append(buf)
+            return Gst.FlowReturn.OK
+
+    import threading
+
+    mon = _Monitor()
+    appsrc = _Appsrc()
+    pusher = EvdiAppsrcPusher(mon, 1, 1, 30)
+    thread = threading.Thread(target=pusher, args=(appsrc,))
+    thread.start()
+    thread.join(timeout=0.35)
+    # join returns when the thread is done; it is still running, so stop it.
+    pusher.stop()
+    thread.join(timeout=1)
+    assert not thread.is_alive()
+    assert pusher.copies == 1
+    assert pusher.repeats >= 4
+    assert mon.released == pusher.copies + pusher.repeats
+    first, later = appsrc.bufs[0], appsrc.bufs[-1]
+    assert first is not later
+    assert first.extract_dup(0, 4) == later.extract_dup(0, 4) == bytes((255, 0, 0, 255))
+    assert later.pts > first.pts
+
+
+def test_serve_pipeline_returns_when_stop_is_set():
+    gi = pytest.importorskip("gi")
+    gi.require_version("Gst", "1.0")
+    import threading
+
+    from segunda_tela.wfd.gst_run import serve_pipeline
+
+    stop = threading.Event()
+
+    def _end() -> None:
+        stop.wait(0.05)
+        # Give the bus loop a moment to enter, then ask it to leave.
+        import time
+        time.sleep(0.25)
+        stop.set()
+
+    threading.Thread(target=_end, daemon=True).start()
+    code = serve_pipeline(
+        "videotestsrc is-live=true ! fakesink sync=false",
+        stop,
+        note=lambda _msg: None,
+    )
+    assert code == 0
+
+
 def test_fps_meter_reports_every_five_seconds():
     clock = {"t": 0.0}
     meter = FpsMeter(5.0, now=lambda: clock["t"])

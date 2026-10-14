@@ -32,6 +32,7 @@ def test_encoder_fragments():
     x264 = encoder_fragment("x264enc", 4096, 30, level_idc=31)
     assert "pass=quant" in x264 and "tune=zerolatency" in x264 and "speed-preset=ultrafast" in x264
     assert 'option-string="level=3.1"' in x264
+    assert 'option-string="level=4.0"' in encoder_fragment("x264enc", 4096, 30, level_idc=40)
     assert "level=" not in encoder_fragment("x264enc", 4096, 30)
     oh = encoder_fragment("openh264enc", 4096, 30)
     assert "usage-type=screen" in oh and "enable-frame-skip=false" in oh and "gop-size=30" in oh

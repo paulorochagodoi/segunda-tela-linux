@@ -34,6 +34,7 @@ class SecondScreenSession:
         audio: bool = False,
         probe_hdcp: bool = False,
         gnd_compat: bool = False,
+        force_1080p30: bool = False,
     ) -> None:
         self.want_size = (width, height) if width and height else None
         self.mode = mode
@@ -48,6 +49,9 @@ class SecondScreenSession:
         self.audio = audio
         self.probe_hdcp = probe_hdcp
         self.gnd_compat = gnd_compat
+        self.force_1080p30 = force_1080p30
+        if force_1080p30:
+            self.want_size = (1920, 1080)
         self.display: Optional[VirtualDisplay] = None
         self.server: Optional[WfdRtspServer] = None
         self.pipeline: Optional[StreamPipeline] = None
@@ -109,7 +113,12 @@ class SecondScreenSession:
             log.info("USB link %s: display mode=%s (same EVDI/portal path as Wi-Fi)", self.usb_link.transport, self.mode)
 
         vw, vh = self.want_size or DEFAULT_VIRTUAL_SIZE
-        self.display = create_virtual_display(vw, vh, self.mode, self.fps, capture=self.capture)
+        # --resolution 1080 locks the EVDI EDID at 1920x1080p30 so the
+        # compositor does not pick 1920x1200 and does not composite at 60 Hz.
+        display_fps = 30 if self.force_1080p30 else self.fps
+        self.display = create_virtual_display(
+            vw, vh, self.mode, display_fps, capture=self.capture, lock_mode=self.force_1080p30,
+        )
         for note in self.display.notes:
             log.warning("%s", note)
         log.info(
@@ -139,6 +148,7 @@ class SecondScreenSession:
             encoder=self.encoder,
             probe_hdcp=self.probe_hdcp,
             gnd_compat=self.gnd_compat,
+            force_1080p30=self.force_1080p30,
         )
         self.server.start_background()
 

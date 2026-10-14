@@ -41,8 +41,9 @@ def test_on_play_evdi_grab_uses_negotiated_bitrate():
         assert pipe.source.backend == "evdi-grab"
         assert pipe.source.stdin_feeder is not None
         desc = pipe.description
-        assert "fdsrc fd=0" in desc
-        assert "rawvideoparse" in desc and "format=rgbx" in desc
+        assert "appsrc name=evdi-src" in desc
+        assert "format=RGBx" in desc
+        assert pipe.source.pipe_gst is not None and "format=rgbx" in pipe.source.pipe_gst
         assert "framerate=30/1" in desc
         assert session.display.fps == 30 and session.display.evdi.fps == 30
         assert f"width={width}" in desc and f"height={height}" in desc
@@ -50,6 +51,21 @@ def test_on_play_evdi_grab_uses_negotiated_bitrate():
         assert pipe.running()
     finally:
         session.stop()
+
+
+def test_resolution_1080_locks_evdi_to_1080p30(monkeypatch):
+    import segunda_tela.session as sess
+
+    seen = {}
+
+    def fake_create(w, h, mode, fps, capture="auto", lock_mode=False):
+        seen.update(w=w, h=h, fps=fps, lock_mode=lock_mode, mode=mode)
+        return VirtualDisplay(w, h, mode, backend="test")
+
+    monkeypatch.setattr(sess, "create_virtual_display", fake_create)
+    session = SecondScreenSession(encoder="x264enc", fps=60, force_1080p30=True)
+    session.prepare_display()
+    assert seen == {"w": 1920, "h": 1080, "fps": 30, "lock_mode": True, "mode": "extend"}
 
 
 def test_on_play_without_negotiation_still_starts():

@@ -184,6 +184,7 @@ def run_ui(args) -> int:
                             usb_link=usb_link, capture=args.capture, encoder=args.encoder, audio=args.audio,
                             probe_hdcp=bool(getattr(args, "probe_hdcp", False)),
                             gnd_compat=bool(getattr(args, "gnd_compat", False)),
+                            force_1080p30=getattr(args, "resolution", None) == "1080",
                         )
                         s.start()
                         notes = "\n".join(s.notes)

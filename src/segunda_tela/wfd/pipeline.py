@@ -23,6 +23,7 @@ Encoder preference (first available wins):
 """
 from __future__ import annotations
 
+import fcntl
 import logging
 import os
 import re
@@ -60,6 +61,10 @@ class CaptureSource:
     stdin_feeder: Optional[Callable] = None  # called with the child's stdin
     feeder_stop: Optional[Callable[[], None]] = None
     notes: list[str] = field(default_factory=list)
+    # EVDI: push into appsrc in this process. `pipe_gst` is the fdsrc graph
+    # used only when the in-process pipeline cannot start.
+    appsrc_pusher: Optional[Callable] = None
+    pipe_gst: Optional[str] = None
 
 
 def pattern_source(width: int, height: int, fps: int) -> CaptureSource:
@@ -349,6 +354,11 @@ class StreamPipeline:
         self._log_thread: Optional[threading.Thread] = None
         self._idr_write: Optional[TextIO] = None
         self._idr_pending = False
+        self._gst_thread: Optional[threading.Thread] = None
+        self._gst_stop: Optional[threading.Event] = None
+        self._gst_ready = threading.Event()
+        self._gst_ok = False
+        self._pipeline_ref = None
 
     @property
     def description(self) -> str:
@@ -369,24 +379,47 @@ class StreamPipeline:
         a line on the IDR pipe and posts a force-key-unit event.
         """
         with self._lock:
+            pipeline = self._pipeline_ref
             writer = self._idr_write
-            if writer is None:
+            if pipeline is None and writer is None:
                 self._idr_pending = True
                 log.info("IDR requested; next regular keyframe is within 1 s (GOP = %s)", self.fps)
                 return False
-            try:
-                writer.write("idr\n")
-                writer.flush()
-            except OSError as exc:
-                log.info("IDR request failed (%s); next regular keyframe is within 1 s", exc)
-                return False
+            if writer is not None:
+                try:
+                    writer.write("idr\n")
+                    writer.flush()
+                except OSError as exc:
+                    log.info("IDR request failed (%s); next regular keyframe is within 1 s", exc)
+                    return False
+        if pipeline is not None:
+            from .gst_run import force_key_unit
+
+            ok = bool(force_key_unit(pipeline))
+            if ok:
+                log.info("IDR request: forced a keyframe")
+            return ok
         log.info("IDR request: forced a keyframe")
         return True
 
     def start(self) -> None:
         with self._lock:
-            if self._proc and self._proc.poll() is None:
+            if self.running():
                 return
+            if self.source.appsrc_pusher is not None and gst_bindings_available():
+                if self._start_inprocess():
+                    log.info("Streaming %sx%s@%s via %s (%s kbps, %s, latency %sms, appsrc) → %s:%s RTP/MP2T",
+                             self.width, self.height, self.fps, self.encoder, self.bitrate_kbps,
+                             self.profile, self._latency_ms(), self.dest_host, self.dest_port)
+                    return
+                log.warning("in-process appsrc did not start; using the frame pipe")
+                if self._gst_stop is not None:
+                    self._gst_stop.set()
+                if self._gst_thread is not None:
+                    self._gst_thread.join(timeout=2)
+                    self._gst_thread = None
+            if self.source.pipe_gst:
+                self.source.gst = self.source.pipe_gst
             if gst_bindings_available() and self._spawn(self._runner_cmd()):
                 log.info("Streaming %sx%s@%s via %s (%s kbps, %s, latency %sms) → %s:%s RTP/MP2T",
                          self.width, self.height, self.fps, self.encoder, self.bitrate_kbps,
@@ -403,6 +436,52 @@ class StreamPipeline:
                      self.profile, self.dest_host, self.dest_port)
             if not self._spawn(self._build_cmd()):
                 raise RuntimeError("failed to start GStreamer")
+
+    def _start_inprocess(self) -> bool:
+        """Run the pipeline on a thread in this process and push EVDI via appsrc.
+
+        Must be called with self._lock held. The GStreamer thread never takes
+        that lock. Waiting for PLAYING here is safe.
+        """
+        self._gst_stop = threading.Event()
+        self._gst_ready.clear()
+        self._gst_ok = False
+        self._pipeline_ref = None
+        self._gst_thread = threading.Thread(target=self._gst_main, name="wfd-gst", daemon=True)
+        self._gst_thread.start()
+        self._gst_ready.wait(timeout=5)
+        return self._gst_ok
+
+    def _gst_main(self) -> None:
+        from .gst_run import serve_pipeline
+
+        def on_playing(pipeline) -> None:
+            self._pipeline_ref = pipeline
+            appsrc = pipeline.get_by_name("evdi-src")
+            if appsrc is None or self.source.appsrc_pusher is None:
+                log.error("evdi-src appsrc missing from the pipeline")
+                if self._gst_stop is not None:
+                    self._gst_stop.set()
+                return
+            self._feeder_thread = threading.Thread(
+                target=self.source.appsrc_pusher, args=(appsrc,), name="evdi-appsrc", daemon=True
+            )
+            self._feeder_thread.start()
+            self._gst_ok = True
+            self._gst_ready.set()
+
+        try:
+            assert self._gst_stop is not None
+            serve_pipeline(
+                self.description, self._gst_stop, on_playing=on_playing, latency_ms=self._latency_ms(),
+                emit=lambda msg: log.info("gst: %s", msg),
+                note=lambda msg: log.warning("gst: %s", msg),
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.error("in-process pipeline: %s", exc)
+        finally:
+            self._pipeline_ref = None
+            self._gst_ready.set()
 
     def _latency_ms(self) -> int:
         # openh264 screen mode spikes; VA and x264 ultrafast stay inside 100 ms.
@@ -448,7 +527,16 @@ class StreamPipeline:
                 stderr=subprocess.STDOUT,
                 pass_fds=tuple(self.source.pass_fds) + extra,
                 env=env,
+                # Ctrl+C goes to this process. The child is stopped with SIGTERM
+                # so its poll loop can leave GStreamer on the main thread.
+                start_new_session=True,
             )
+            if proc.stdin is not None:
+                try:
+                    # One write of a 1920x1200 frame instead of 64 KiB chunks.
+                    fcntl.fcntl(proc.stdin.fileno(), 1031, 8 * 1024 * 1024)  # F_SETPIPE_SZ
+                except OSError:
+                    pass
         except OSError as exc:
             log.warning("failed to start %s: %s", cmd[0], exc)
             if idr_fds:
@@ -492,24 +580,34 @@ class StreamPipeline:
             log.error("gst-launch exited with %s", code)
 
     def running(self) -> bool:
+        if self._gst_thread is not None and self._gst_thread.is_alive() and self._gst_ok:
+            return True
         return bool(self._proc and self._proc.poll() is None)
 
     def stop(self) -> None:
         with self._lock:
-            if not self._proc:
+            thread = self._gst_thread
+            proc = self._proc
+            if thread is None and proc is None:
                 return
             log.info("Stopping stream")
             if self.source.feeder_stop:
                 self.source.feeder_stop()
+            if self._gst_stop is not None:
+                self._gst_stop.set()
             if self._idr_write is not None:
                 try:
                     self._idr_write.close()
                 except OSError:
                     pass
                 self._idr_write = None
-            self._proc.terminate()
-            try:
-                self._proc.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                self._proc.kill()
+            self._gst_thread = None
             self._proc = None
+        if thread is not None:
+            thread.join(timeout=3)
+        if proc is not None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
