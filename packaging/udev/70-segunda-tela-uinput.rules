@@ -1,0 +1,6 @@
+# Segunda Tela para Linux — touchscreen uinput do modo --usb-vnc.
+# O dispositivo absoluto "Segunda Tela VNC" é mapeado só na saída EVDI.
+# TAG+="uaccess" entrega /dev/uinput ao usuário da sessão (logind), sem root.
+# Install: sudo ./scripts/install-deps-popos.sh
+
+KERNEL=="uinput", SUBSYSTEM=="misc", MODE="0660", GROUP="input", TAG+="uaccess"

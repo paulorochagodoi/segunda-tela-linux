@@ -186,19 +186,24 @@ class Adb:
     def available(self) -> bool:
         return self._runner is not None or shutil.which(self.exe) is not None
 
-    def run(self, *args: str, timeout: float = 10.0, device: bool = True) -> tuple[int, str]:
+    def run(self, *args: str, timeout: float = 10.0, device: bool = True, redact: str = "") -> tuple[int, str]:
         argv = [self.exe]
         if device and self.serial:
             argv += ["-s", self.serial]
         argv += list(args)
         rc, out = (self._runner or _default_runner)(argv, timeout)
+        shown = " ".join(argv[1:])
+        if redact:
+            shown = shown.replace(redact, "********")
         short = out.strip().splitlines()[0][:120] if out.strip() else ""
-        self.log.append(f"$ {' '.join(argv[1:])} → rc={rc}{(' ' + short) if short else ''}")
-        log.debug("adb %s → rc=%s %s", " ".join(argv[1:]), rc, out.strip()[:500])
+        if redact and short:
+            short = short.replace(redact, "********")
+        self.log.append(f"$ {shown} → rc={rc}{(' ' + short) if short else ''}")
+        log.debug("adb %s → rc=%s %s", shown, rc, (out or "").replace(redact, "********").strip()[:500] if redact else (out or "").strip()[:500])
         return rc, out
 
-    def shell(self, cmd: str, timeout: float = 10.0) -> tuple[int, str]:
-        return self.run("shell", cmd, timeout=timeout)
+    def shell(self, cmd: str, timeout: float = 10.0, redact: str = "") -> tuple[int, str]:
+        return self.run("shell", cmd, timeout=timeout, redact=redact)
 
     def devices(self) -> list[tuple[str, str]]:
         if not self.available():

@@ -61,5 +61,6 @@ echo "Instalado. Rode: segunda-tela --ui   ou   segunda-tela list"
 echo "Estender (monitor virtual): sudo $ROOT/scripts/setup-evdi.sh  (uma vez; ver docs/COSMIC.md)"
 echo "Diagnóstico: segunda-tela doctor"
 echo "Opcional USB: sudo $ROOT/scripts/install-udev-samsung.sh"
+echo "Cabo VNC (tablet como tela estendida): segunda-tela --usb-vnc   (docs/CABO-VNC.md)"
 # sanity
 "$ROOT/.venv/bin/segunda-tela" --version || true

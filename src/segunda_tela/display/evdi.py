@@ -278,6 +278,7 @@ class EvdiMonitor:
         self._stat_t0 = time.monotonic()
         self._stat_grabs = 0
         self._stat_frames = 0
+        self._damage: list[tuple[int, int, int, int]] = []
         self._ctx = EvdiEventContext(
             dpms_handler=_DPMS_CB(self._on_dpms),
             mode_changed_handler=_MODE_CB(self._on_mode),
@@ -365,6 +366,28 @@ class EvdiMonitor:
             if self._slots is not None:
                 self._slots.release()
 
+    def wait_frame_damage(
+        self, after_seq: int, timeout: float,
+    ) -> tuple[int, Optional[memoryview], list[tuple[int, int, int, int]]]:
+        """Like `wait_frame`, plus the damage rects folded into this frame.
+
+        Rects are exclusive-end `(x1, y1, x2, y2)` in framebuffer pixels.
+        The caller must `release_frame`. Damage is handed out once.
+        """
+        with self._frame_lock:
+            deadline = time.monotonic() + timeout
+            while self._frame_seq <= after_seq:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                self._frame_lock.wait(remaining)
+            view = self._slots.acquire() if self._slots is not None else None
+            if self._frame_seq <= after_seq:
+                return self._frame_seq, view, []
+            damage = self._damage
+            self._damage = []
+            return self._frame_seq, view, damage
+
     # -------------------------------------------------------------- callbacks
     def _on_dpms(self, mode: int, _ud) -> None:
         self.dpms = mode
@@ -429,6 +452,9 @@ class EvdiMonitor:
             self._stat_grabs += 1
             if self._slots is not None and self._slots.apply(memoryview(self._buf), rects):
                 self._frame_seq = self._slots.seq
+                self._damage.extend(rects)
+                if len(self._damage) > 64 and self._slots is not None:
+                    self._damage = [(0, 0, self._slots.width, self._slots.height)]
                 self._stat_frames += 1
                 self._frame_lock.notify_all()
             self._log_grab_fps()

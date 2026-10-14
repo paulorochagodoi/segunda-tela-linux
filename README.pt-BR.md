@@ -23,6 +23,14 @@ segunda-tela -v --usb --mode extend
 
 Detalhes e limites: [docs/USB.md](docs/USB.md).
 
+Cabo USB como segunda tela por VNC (sem Miracast; bVNC no tablet):
+
+```bash
+segunda-tela --usb-vnc
+```
+
+Passo a passo: [docs/CABO-VNC.md](docs/CABO-VNC.md).
+
 ## UI e o erro «No module named gi»
 
 O módulo `gi` vem do apt (`python3-gi`), não do pip. O `install.sh` usa

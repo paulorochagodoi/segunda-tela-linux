@@ -86,6 +86,12 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="USB cable mode: detect Samsung (VID 04e8), use tether/adb, then WFD over that link",
     )
+    p.add_argument(
+        "--usb-vnc",
+        action="store_true",
+        help="Extend the EVDI output over USB with VNC (adb reverse tcp:5900, bVNC on the tablet). "
+             "Does not use Wi-Fi Display. See docs/CABO-VNC.md.",
+    )
     p.add_argument("--prefer-adb", action="store_true", help="With --usb, try adb reverse before USB tethering")
     p.add_argument("--usb-wait", type=float, default=20.0, help="Seconds to wait for USB tether interface (default 20)")
     _usb_initiate_args(p)
@@ -109,7 +115,7 @@ def build_parser() -> argparse.ArgumentParser:
     list_p.add_argument("--timeout", type=float, default=15.0, help="Discovery seconds (default 15)")
     list_p.add_argument("--all", action="store_true", help="Also show peers without WFD IEs")
     sub.add_parser("doctor", help="Check EVDI (and that COSMIC extends onto it), GStreamer encoders, "
-                                  "NetworkManager P2P, portal and USB/adb")
+                                  "NetworkManager P2P, portal, USB/adb and USB VNC (uinput)")
     return p
 
 
@@ -206,6 +212,15 @@ def cmd_doctor(_args) -> int:
             print(f"[..] {label}{(' — ' + detail) if detail else ''}")
         else:
             line(status == "ok", label, detail)
+
+    from .vnc.doctor import vnc_checks
+
+    print("-- USB VNC (cabo) --")
+    for status, label, detail in vnc_checks():
+        if status == "info":
+            print(f"[..] {label}{(' — ' + detail) if detail else ''}")
+        else:
+            line(status == "ok", label, detail)
     return 0 if ok else 1
 
 
@@ -223,6 +238,43 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_doctor(args)
 
     use_usb = bool(getattr(args, "usb", False) or args.command == "usb")
+    if getattr(args, "usb_vnc", False):
+        if use_usb or args.device or args.ui or args.loopback_test or args.usb_detect_test:
+            print("`--usb-vnc` não combina com --usb, --device, --ui ou os testes de loopback.",
+                  file=sys.stderr)
+            return 2
+        from .vnc.link import VncLinkError
+        from .vnc.session import UsbVncSession
+        from .display.evdi import EvdiError
+
+        session = UsbVncSession(
+            width=args.width or 1920,
+            height=args.height or 1200,
+            fps=args.fps or 60,
+            port=5900,
+            wait_tether_s=args.usb_wait,
+            launch=not args.no_usb_launch,
+        )
+
+        def _stop(*_a):
+            session.stop()
+
+        signal.signal(signal.SIGINT, _stop)
+        signal.signal(signal.SIGTERM, _stop)
+        try:
+            session.start()
+        except (EvdiError, VncLinkError, OSError) as exc:
+            print(f"USB VNC: {exc}", file=sys.stderr)
+            session.stop()
+            return 2
+        for line in session.banner_lines():
+            print(line, flush=True)
+        print("Unofficial project — not affiliated with Samsung. Ctrl+C to stop.", flush=True)
+        try:
+            session.wait()
+        finally:
+            session.stop()
+        return 0
     prefer_adb = args.prefer_adb
     usb_wait = args.usb_wait
 

@@ -23,6 +23,7 @@ como **segunda tela estendida** no **Pop!_OS** e outros desktops Linux, via
 | Captura só do monitor virtual: portal ScreenCast (COSMIC) ou leitura direta do EVDI | Implementado · **não testado em hardware** |
 | Espelhar (`--mode mirror`) via portal / X11 | Implementado |
 | USB cabo: adb como túnel de portas (no lugar do Connlib) → *source ready* MS-MICE na :7250 do tablet, tablet conecta de volta na :7236; RTP pelo tether | Implementado · testado contra tablet simulado · **não testado em hardware** |
+| USB cabo VNC (`--usb-vnc`): o mesmo monitor EVDI, só essa saída, RFB (Tight/ZRLE) via `adb reverse` :5900 e bVNC; toque por uinput nessa saída | Implementado · testado sem hardware · **não testado no Tab** |
 | Pareamento MCF “Second Screen” one-tap da Samsung | **Não** — ver [docs/SAMSUNG_MCF.md](docs/SAMSUNG_MCF.md) |
 | UIBC / toque / S Pen | Não implementado |
 
@@ -109,6 +110,24 @@ envia o *source ready* por `adb forward` e espera o tablet conectar. O vídeo
 Bluetooth (MCF), que não reproduzimos — abra a “Segunda tela” no painel
 rápido antes. Se não atender, use Wi-Fi Direct (`--device`). Detalhes:
 [docs/USB.md](docs/USB.md).
+
+### Cabo com VNC (estender de verdade)
+
+O modo `--usb` acima ainda depende do receptor Miracast do tablet. Para estender
+o desktop pelo cabo sem Wi-Fi Display:
+
+```bash
+# Tablet: Depuração USB aceita, e o app bVNC (com.iiordanov.freebVNC) instalado.
+segunda-tela doctor
+segunda-tela --usb-vnc
+```
+
+O PC cria a "Segunda Tela" (EVDI, à direita do eDP-1), escuta VNC só em
+`127.0.0.1:5900` e faz `adb reverse tcp:5900 tcp:5900`. A senha sai no
+terminal. O bVNC abre sozinho em `vnc://127.0.0.1:5900`. O toque volta por um
+dispositivo uinput mapeado só nessa saída. O `wayvnc` do Pop!_OS 24.04 (0.7.2)
+não serve: o cosmic-comp não tem `wlr-screencopy`. Passo a passo:
+[docs/CABO-VNC.md](docs/CABO-VNC.md).
 
 ### Log e «não é possível exibir o conteúdo porque não é seguro»
 
@@ -209,6 +228,13 @@ don't reproduce, so open "Second screen" on the tablet first; Wi-Fi Direct
 (`--device`) remains the fallback. `segunda-tela doctor` has a USB section
 (adb, authorization, tether iface/IP, peer reachability, ports). Details:
 [docs/USB.md](docs/USB.md). Samsung's MCF one-tap pairing is out of scope.
+
+`segunda-tela --usb-vnc` (0.3.5) is the cable path that does not use Miracast:
+the EVDI output is placed to the right of eDP-1 and served alone over VNC
+through `adb reverse tcp:5900`, with bVNC Free launched on the tablet and
+touch injected by a uinput device mapped to that output. noble's wayvnc 0.7.2
+cannot select the output on COSMIC (no `wlr-screencopy`). Steps and limits:
+[docs/CABO-VNC.md](docs/CABO-VNC.md).
 
 Content protection (0.3.3): Galaxy sinks answer `wfd_content_protection:
 HDCP2.x port=…` when M3 asks for it, then expect an HDCP session (Windows'

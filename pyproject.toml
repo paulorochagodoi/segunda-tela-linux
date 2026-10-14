@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "segunda-tela-linux"
-version = "0.3.4"
+version = "0.3.5"
 description = "Unofficial Wi-Fi Display (Miracast) source to use a tablet as a second screen on Linux / Pop!_OS"
 readme = "README.md"
 license = { text = "MIT" }
