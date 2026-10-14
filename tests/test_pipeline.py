@@ -20,6 +20,9 @@ def test_pick_encoder_order():
     assert pick_encoder(available=lambda n: n == "openh264enc") == "openh264enc"
     assert pick_encoder(available=lambda n: False) == "x264enc"
     assert pick_encoder("x264enc", available=lambda n: False) == "x264enc"
+    both = lambda n: n in {"vah264enc", "x264enc"}
+    assert pick_encoder(available=both, allow_hw=False) == "x264enc"
+    assert pick_encoder("vah264enc", available=both, allow_hw=False) == "x264enc"
 
 
 def test_encoder_fragments():

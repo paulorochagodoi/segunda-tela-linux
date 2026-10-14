@@ -44,6 +44,9 @@ def vnc_checks(
     free = local_port_free(port, "127.0.0.1")
     yield ("ok" if free else "fail"), f"porta local TCP {port} livre", (
         "" if free else "outro processo escuta 127.0.0.1 (segunda-tela --usb-vnc já rodando?)")
+    from .encode import describe_jpeg_encoder
+
+    yield "info", "encoder JPEG", describe_jpeg_encoder(allow_hw=True)
     yield "info", "bVNC no tablet", (
         "instale com.iiordanov.freebVNC (Play Store: bVNC). "
         "Com o adb autorizado o app abre em "

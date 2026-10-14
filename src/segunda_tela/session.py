@@ -34,6 +34,7 @@ class SecondScreenSession:
         audio: bool = False,
         probe_hdcp: bool = False,
         gnd_compat: bool = False,
+        allow_hw: bool = True,
     ) -> None:
         self.want_size = (width, height) if width and height else None
         self.mode = mode
@@ -43,7 +44,9 @@ class SecondScreenSession:
         self.usb_link = usb_link
         self.p2p_link = p2p_link
         self.capture = capture
-        self.encoder = pick_encoder(encoder)
+        self.encoder = pick_encoder(encoder, allow_hw=allow_hw)
+        where = "VA-API" if self.encoder in HW_ENCODERS else "CPU"
+        log.info("WFD H.264 encoder: %s (%s)", self.encoder, where)
         self.fps = fps or (60 if self.encoder in HW_ENCODERS else 30)
         self.audio = audio
         self.probe_hdcp = probe_hdcp

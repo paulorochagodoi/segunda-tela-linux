@@ -131,19 +131,32 @@ A seção `-- USB --` continua valendo para o adb (autorização, cabo Samsung).
   O byte de controle do Tight tem o tipo no nibble alto (preenchimento `0x80`,
   JPEG `0x90`, zlib com reset do stream 0 em `0x01`) — é assim que o bVNC
   desloca os 4 bits de reset antes de ler o subtipo.
-- Cada cliente VNC tem uma thread só para ler. O `sendall` de um quadro no adb
-  bloqueia; o ponteiro é lido e injetado no uinput nessa outra thread. O log
-  mostra `VNC pointer` (mudança de botão na hora, movimento algumas vezes por
-  segundo) e a linha `VNC fps` conta todos.
+- Cada cliente VNC tem uma thread só para ler e outra só para o `sendall`.
+  Codificar o quadro seguinte acontece enquanto o anterior ainda sai pelo adb,
+  senão um quadro cheio caía para ~18 fps (encode + envio somados, e às vezes
+  dois JPEGs seguidos para caber em 200 KB). Quadro grande é um JPEG só
+  (qualidade ~58 em 1920×1200, ~70 numa janela). O log mostra `VNC encode`,
+  `VNC send` e `VNC encoder ativo`.
+- Hardware: se `gst-inspect-1.0 vajpegenc` e `vapostproc` existem, um quadro
+  grande usa VA-API JPEG. Sem o plugin, sem GPU, ou com `--no-hw`, o mesmo
+  Tight JPEG sai pela CPU (simplejpeg / Pillow). O Wi-Fi Display já escolhe
+  `vah264enc` quando o plugin VA está instalado (o mesmo grafo do PR do WFD);
+  `--no-hw` força `x264enc`. Não há cliente Android livre que estenda a área
+  de trabalho por H.264 neste cabo e devolva toque — o bVNC fala RFB, então
+  o cabo continua VNC. H.264 fica no caminho sem fio.
+- O teclado do tablet vira um uinput à parte (`Segunda Tela VNC Teclado`),
+  com a roda do mouse (`REL_WHEEL`). A roda não é um clique. Letras seguem a
+  posição evdev; o layout do COSMIC (ABNT2 ou US) é quem produz o caractere.
 - A saída VNC fica em ~30 fps mesmo com `--fps 60`. O grab do EVDI continua na
   taxa do monitor. O log `EVDI grab fps` inclui sync/async/reask, o tempo do
   `grab_pixels` e o último retângulo (quantidade e pixels). Se `last 1 rects`
   for a tela inteira, o kernel só entregou um clip — o JPEG é o que reduz o
   tamanho, não dá para inventar dano menor.
-- Foto vai em JPEG qualidade ~70 (simplejpeg, senão turbojpeg, senão Pillow),
-  com nova tentativa em 55/40/30 se passar de ~200 KB. Interface com poucas
-  cores ou borda dura fica em zlib. Sem Pillow e sem simplejpeg o JPEG não
-  existe e a região fotográfica volta para zlib (o `install.sh` instala os dois).
+- Foto vai em JPEG. Janela pequena fica na qualidade ~70. Quadro de tela
+  cheia é um encode só (~58), com no máximo uma segunda passagem se passar de
+  ~200 KB. VA-API (`vajpegenc`) entra nesse quadro grande quando o plugin
+  existe; senão simplejpeg / turbojpeg / Pillow. Interface com poucas cores
+  fica em zlib. `--no-hw` desliga o VA-API.
 - O cursor do compositor não entra no grab do EVDI. O VNC desenha uma seta na
   posição do dedo. O toque em si vai para o uinput mapeado em `DVI-I-1`.
 - Um pedido incremental sem pixels novos fica pendente até chegar dano. Uma
@@ -152,8 +165,10 @@ A seção `-- USB --` continua valendo para o adb (autorização, cabo Samsung).
   releem `input_devices` sozinhas; se o toque cair no eDP-1, saia e entre na
   sessão ou confira o nome da saída com `cosmic-randr list` (algo como
   `DVI-I-1`, não "Segunda Tela").
-- O teclado do tablet não é injetado. O botão esquerdo do VNC é o dedo; roda
-  do mouse não.
+- O botão esquerdo do VNC é o dedo. A roda e o teclado vão para o uinput
+  `Segunda Tela VNC Teclado` (não para o touchscreen, senão o COSMIC mapeia
+  a tecla só na saída errada). Um keysym sem mapa aparece no log como
+  `VNC key sem mapa`.
 - A senha aparece no terminal e na linha de comando do `adb shell` (o processo
   local). O log em `~/.local/state/segunda-tela/` grava essa chamada com a
   senha trocada por `********`.
@@ -179,7 +194,11 @@ cosmic-comp does not implement. bVNC is started with `am start -n` on
 `com.iiordanov.freebVNC/com.iiordanov.bVNC.RemoteCanvasActivity` (a bare
 `vnc://` VIEW intent opened Emergency alerts on One UI). Tight bytes are
 R,G,B because bVNC's Tight decoder paints byte 0 as red; Raw and ZRLE follow
-the C24bit shifts. Photo damage is Tight JPEG (control `0x90`, quality about
-70); other damage is zlib. Only EVDI's dirty rectangles are sent, capped
-around 30 fps, and pointer events are read on a thread that does not wait
-on `sendall`. See the Portuguese sections for the procedure.
+the C24bit shifts. Photo damage is Tight JPEG (control `0x90`). Large frames
+are one JPEG, VA-API (`vajpegenc`) when that element is installed, libjpeg
+otherwise, overlapped with `sendall` so a full-screen change stays nearer
+30 fps. `--no-hw` forces the CPU. Wireless WFD already picks `vah264enc`
+when the VA plugin is present; the same flag skips it. There is no free
+Android client that extends the desktop over H.264 on this cable and returns
+touch, so the cable stays VNC. Keyboard and scroll wheel are a separate
+uinput device. See the Portuguese sections for the procedure.

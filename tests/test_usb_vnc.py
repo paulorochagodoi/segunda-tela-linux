@@ -247,6 +247,137 @@ def test_photo_region_is_jpeg_and_flat_ui_stays_zlib():
     assert flat[0] == 0x01
 
 
+def test_full_frame_jpeg_encodes_once():
+    """A 70/55/40/30 ladder made full-screen updates ~18 fps."""
+    import segunda_tela.vnc.encode as enc
+    fmt = PixelFormat.bvnc()
+    w, h = 1920, 1080
+    buf = bytearray(w * h * 4)
+    buf[0] = 1  # not a solid fill
+    calls = []
+
+    def fake(rgb, width, height, quality):
+        calls.append(quality)
+        return b"\xff\xd8" + bytes((quality,)) + b"\xff\xd9"
+
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr(enc, "looks_photographic", lambda *_a, **_k: True)
+    monkeypatch.setattr(enc, "_encode_jpeg_rgb", fake)
+    monkeypatch.setattr(enc, "_try_va_jpeg", lambda *_a, **_k: None)
+    try:
+        payload = enc.encode_tight(bytes(buf), fmt, width=w, height=h)
+    finally:
+        monkeypatch.undo()
+    assert calls == [enc.jpeg_quality_for(w, h)]
+    assert payload[0] == 0x90
+    assert enc.jpeg_quality_for(320, 240) == 70
+
+
+def test_oversize_jpeg_retries_once(monkeypatch):
+    import segunda_tela.vnc.encode as enc
+    fmt = PixelFormat.bvnc()
+    w, h = 1920, 1080
+    buf = bytearray(w * h * 4)
+    buf[0] = 2
+    calls = []
+
+    def fake(rgb, width, height, quality):
+        calls.append(quality)
+        pad = (250 * 1024) if len(calls) == 1 else 32
+        return b"\xff\xd8" + b"\x00" * pad + b"\xff\xd9"
+
+    monkeypatch.setattr(enc, "looks_photographic", lambda *_a, **_k: True)
+    monkeypatch.setattr(enc, "_encode_jpeg_rgb", fake)
+    monkeypatch.setattr(enc, "_try_va_jpeg", lambda *_a, **_k: None)
+    payload = enc.encode_tight(bytes(buf), fmt, width=w, height=h)
+    assert calls == [58, 40]
+    assert payload[0] == 0x90
+    assert len(payload) < 200 * 1024
+
+
+def test_va_jpeg_command_and_large_frame_prefers_it(monkeypatch):
+    from segunda_tela.vnc.va_jpeg import va_jpeg_command
+    cmd = va_jpeg_command(1920, 1200, 58, 3, 4)
+    assert "vajpegenc" in cmd and "vapostproc" in cmd and "quality=58" in cmd
+    assert "format=rgb" in cmd
+    import segunda_tela.vnc.encode as enc
+    fmt = PixelFormat.bvnc()
+    w, h = 1280, 720
+    buf = bytearray(w * h * 4)
+    buf[0] = 3
+    cpu = []
+
+    def va(rgb, width, height, quality):
+        return b"\xff\xd8VA\xff\xd9"
+
+    monkeypatch.setattr(enc, "looks_photographic", lambda *_a, **_k: True)
+    monkeypatch.setattr(enc, "_try_va_jpeg", va)
+    monkeypatch.setattr(enc, "_encode_jpeg_rgb", lambda *_a, **_k: cpu.append(1) or b"\xff\xd8\xff\xd9")
+    payload = enc.encode_tight(bytes(buf), fmt, width=w, height=h)
+    assert b"VA" in payload
+    assert cpu == []
+    enc.set_jpeg_hardware(False)
+    try:
+        assert "no-hw" in enc.describe_jpeg_encoder(False)
+    finally:
+        enc.set_jpeg_hardware(True)
+
+
+def test_va_jpeg_write_gives_up_when_the_pipe_stays_full():
+    """A VA pipeline that never reads must not stall the VNC encoder."""
+    import os
+
+    from segunda_tela.vnc.va_jpeg import _VaJpegPipe
+
+    pipe = _VaJpegPipe()
+    read_fd, write_fd = os.pipe()
+    os.set_blocking(write_fd, False)
+    try:
+        while True:
+            os.write(write_fd, b"x" * 65536)
+    except BlockingIOError:
+        pass
+    pipe._in_w = write_fd
+    started = time.monotonic()
+    try:
+        assert pipe._write_frame(b"rgb" * 4096, time.monotonic() + 0.3) is False
+    finally:
+        pipe._in_w = None
+        os.close(read_fd)
+        os.close(write_fd)
+    assert time.monotonic() - started < 1.0
+
+
+def test_keysym_and_wheel_bits():
+    from segunda_tela.vnc.keys import (
+        KEY_A,
+        KEY_ENTER,
+        KEY_LEFT,
+        KEY_LEFTSHIFT,
+        contact_buttons,
+        plan_key,
+        wheel_delta,
+    )
+    assert wheel_delta(8, 0) == (0, 1)
+    assert wheel_delta(16, 0) == (0, -1)
+    assert wheel_delta(0, 8) == (0, 0)
+    assert contact_buttons(8) == 0
+    assert contact_buttons(1 | 8) == 1
+    down, shift, synth = plan_key(0x61, True, shift_down=False, synth_shift=False)
+    assert down == [(KEY_A, 1)] and not synth
+    shifted, shift, synth = plan_key(0x41, True, shift_down=False, synth_shift=False)
+    assert shifted[0] == (KEY_LEFTSHIFT, 1) and shifted[1] == (KEY_A, 1) and synth
+    released, shift, synth = plan_key(0x41, False, shift_down=shift, synth_shift=synth)
+    assert (KEY_A, 0) in released and (KEY_LEFTSHIFT, 0) in released and not synth
+    already, _, synth2 = plan_key(0x41, True, shift_down=True, synth_shift=False)
+    assert already == [(KEY_A, 1)] and not synth2
+    enter, _, _ = plan_key(0xFF0D, True, shift_down=False, synth_shift=False)
+    assert enter == [(KEY_ENTER, 1)]
+    left, _, _ = plan_key(0xFF51, True, shift_down=False, synth_shift=False)
+    assert left == [(KEY_LEFT, 1)]
+    assert plan_key(0xE7, True, shift_down=False, synth_shift=False) is None
+
+
 def test_vnc_output_is_capped_at_30fps():
     assert output_interval(60) == pytest.approx(1 / 30)
     assert output_interval(10) == pytest.approx(0.1)
@@ -627,6 +758,8 @@ def test_doctor_vnc_section(tmp_path):
 def test_cli_usb_vnc_flag_and_conflict(monkeypatch):
     args = build_parser().parse_args(["--usb-vnc", "--width", "1280", "--height", "800", "--fps", "30"])
     assert args.usb_vnc and args.width == 1280 and args.fps == 30
+    assert build_parser().parse_args(["--no-hw"]).no_hw is True
+    assert args.no_hw is False
     assert main(["--usb-vnc", "--usb"]) == 2
 
     def boom(**_k):

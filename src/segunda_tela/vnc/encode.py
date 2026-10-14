@@ -12,9 +12,12 @@ subencoding. Fill is 0x80, JPEG is 0x90, basic compression with stream 0
 reset is 0x01. A low-nibble 0x09 is basic compression to that client, which
 is why a JPEG has to carry the type in the high nibble.
 
-Photo-like damage is Tight JPEG around quality 70 (simplejpeg, then
-turbojpeg, then Pillow). UI-like damage stays zlib level 1. The byte budget
-retries a lower quality so one rectangle stays near 200 KB over adb.
+Photo-like damage is Tight JPEG. A large frame is one encode (quality ~58
+on a full HD framebuffer, ~70 on a window). A second pass happens only when
+that blob is still over ~200 KB — walking 70/55/40/30 made full-screen
+updates land near 18 fps. VA-API (`vajpegenc`) is used for those large
+frames when the element is present; libjpeg (simplejpeg, turbojpeg, Pillow)
+is the fallback. UI-like damage stays zlib level 1.
 """
 from __future__ import annotations
 
@@ -45,6 +48,9 @@ TIGHT_JPEG = 0x90
 JPEG_QUALITY = 70
 JPEG_BYTE_BUDGET = 200 * 1024
 PHOTO_MIN_PIXELS = 96 * 96
+# Set by the session. `--no-hw` turns VA-API JPEG off; CPU JPEG stays.
+_allow_hw_jpeg = True
+_active_encoder = "cpu"
 
 
 @dataclass(frozen=True)
@@ -398,6 +404,46 @@ _TURBO = None
 _JPEG_WARNED = False
 
 
+def set_jpeg_hardware(allow: bool) -> None:
+    global _allow_hw_jpeg
+    _allow_hw_jpeg = bool(allow)
+
+
+def active_encoder() -> str:
+    """Last rectangle encoder: `va-jpeg`, `cpu-jpeg`, `zlib`, or `fill`."""
+    return _active_encoder
+
+
+def _note_encoder(name: str) -> None:
+    global _active_encoder
+    if name == _active_encoder:
+        return
+    _active_encoder = name
+    log.info("VNC encoder ativo: %s", name)
+
+
+def jpeg_quality_for(width: int, height: int) -> int:
+    """One quality for this rectangle. Full-screen frames skip the 70→30 ladder."""
+    area = width * height
+    if area >= 1920 * 1080:
+        return 58
+    if area >= 1280 * 720:
+        return 64
+    return JPEG_QUALITY
+
+
+def describe_jpeg_encoder(allow_hw: bool) -> str:
+    """What `--usb-vnc` will use. Does not start a pipeline."""
+    from .va_jpeg import va_jpeg_elements_present
+
+    cpu = jpeg_backend() or "zlib"
+    if not allow_hw:
+        return f"CPU JPEG ({cpu}); --no-hw"
+    if va_jpeg_elements_present():
+        return f"VA-API JPEG (vajpegenc) para quadros grandes; CPU {cpu} no resto"
+    return f"CPU JPEG ({cpu}); vajpegenc/vapostproc ausente"
+
+
 def jpeg_backend() -> str | None:
     """`simplejpeg`, `turbojpeg`, `pil`, or None when no encoder is installed."""
     global _JPEG_BACKEND, _TURBO
@@ -435,6 +481,15 @@ def _rgb_pixels(rgbx: bytes | bytearray | memoryview, width: int, height: int):
     return _pack_rgb(rgbx)
 
 
+def _as_hwc(rgb, width: int, height: int):
+    """HxWx3 uint8 ndarray, or the original bytes when numpy is absent."""
+    if np is None:
+        return bytes(rgb) if not isinstance(rgb, (bytes, bytearray)) else bytes(rgb)
+    if isinstance(rgb, (bytes, bytearray)):
+        return np.frombuffer(rgb, dtype=np.uint8).reshape(height, width, 3)
+    return rgb
+
+
 def _encode_jpeg_rgb(rgb, width: int, height: int, quality: int) -> bytes | None:
     global _JPEG_WARNED
     backend = jpeg_backend()
@@ -446,20 +501,21 @@ def _encode_jpeg_rgb(rgb, width: int, height: int, quality: int) -> bytes | None
     try:
         if backend == "simplejpeg":
             import simplejpeg
-            arr = rgb if np is not None and not isinstance(rgb, (bytes, bytearray)) else None
-            if arr is None:
+            if np is None:
                 return None
+            arr = np.ascontiguousarray(_as_hwc(rgb, width, height))
             return simplejpeg.encode_jpeg(
                 arr, quality=quality, colorspace="RGB", colorsubsampling="420", fastdct=True,
             )
         if backend == "turbojpeg":
             from turbojpeg import TJPF_RGB, TJSAMP_420
-            if _TURBO is None or isinstance(rgb, (bytes, bytearray)):
+            if _TURBO is None or np is None:
                 return None
-            return _TURBO.encode(rgb, quality=quality, pixel_format=TJPF_RGB, jpeg_subsample=TJSAMP_420)
+            arr = np.ascontiguousarray(_as_hwc(rgb, width, height))
+            return _TURBO.encode(arr, quality=quality, pixel_format=TJPF_RGB, jpeg_subsample=TJSAMP_420)
         from PIL import Image
-        if np is not None and not isinstance(rgb, (bytes, bytearray)):
-            image = Image.fromarray(rgb, "RGB")
+        if np is not None:
+            image = Image.fromarray(np.ascontiguousarray(_as_hwc(rgb, width, height)), "RGB")
         else:
             image = Image.frombytes("RGB", (width, height), bytes(rgb))
         buf = io.BytesIO()
@@ -470,20 +526,50 @@ def _encode_jpeg_rgb(rgb, width: int, height: int, quality: int) -> bytes | None
         return None
 
 
-def _tight_jpeg(rgbx: bytes | bytearray | memoryview, width: int, height: int) -> bytes | None:
-    """Tight JPEG rectangle (control 0x90 + compact length + JPEG), or None."""
-    rgb = _rgb_pixels(rgbx, width, height)
-    best: bytes | None = None
-    for quality in (JPEG_QUALITY, 55, 40, 30):
-        blob = _encode_jpeg_rgb(rgb, width, height, quality)
-        if not blob or len(blob) < 4 or blob[:2] != b"\xff\xd8":
-            break
-        best = blob
-        if len(blob) <= JPEG_BYTE_BUDGET:
-            break
-    if not best or len(best) > 0x3FFFFF:
+def _wrap_jpeg(blob: bytes) -> bytes | None:
+    if len(blob) < 4 or blob[:2] != b"\xff\xd8" or len(blob) > 0x3FFFFF:
         return None
-    return bytes((TIGHT_JPEG,)) + write_compact(len(best)) + best
+    return bytes((TIGHT_JPEG,)) + write_compact(len(blob)) + blob
+
+
+def _rgb_bytes(rgb) -> bytes:
+    if isinstance(rgb, (bytes, bytearray)):
+        return bytes(rgb)
+    return rgb.tobytes()
+
+
+def _try_va_jpeg(rgb: bytes, width: int, height: int, quality: int) -> bytes | None:
+    if not _allow_hw_jpeg or width * height < 640 * 480:
+        return None
+    from .va_jpeg import encode_va_jpeg
+
+    return encode_va_jpeg(rgb, width, height, quality)
+
+
+def _tight_jpeg(rgbx: bytes | bytearray | memoryview, width: int, height: int) -> bytes | None:
+    """Tight JPEG rectangle (control 0x90 + compact length + JPEG), or None.
+
+    Large frames try VA-API once. CPU is a single encode, plus one softer
+    retry when the first blob is over the adb budget.
+    """
+    quality = jpeg_quality_for(width, height)
+    rgb = _rgb_bytes(_rgb_pixels(rgbx, width, height))
+    va = _try_va_jpeg(rgb, width, height, quality)
+    if va is not None:
+        wrapped = _wrap_jpeg(va)
+        if wrapped is not None:
+            _note_encoder("va-jpeg")
+            return wrapped
+    blob = _encode_jpeg_rgb(rgb, width, height, quality)
+    if blob and len(blob) > JPEG_BYTE_BUDGET and quality > 40:
+        softer = _encode_jpeg_rgb(rgb, width, height, max(40, quality - 20))
+        if softer and len(softer) < len(blob):
+            blob = softer
+    wrapped = _wrap_jpeg(blob) if blob else None
+    if wrapped is not None:
+        backend = jpeg_backend() or "cpu"
+        _note_encoder(f"cpu-jpeg ({backend})")
+    return wrapped
 
 
 def encode_tight(
@@ -496,6 +582,7 @@ def encode_tight(
     """One Tight rectangle payload (no x/y/w/h header)."""
     solid = solid_rgbx(rgbx)
     if solid is not None:
+        _note_encoder("fill")
         return bytes((TIGHT_FILL,)) + pack_tight(solid, fmt)
     if (
         width > 0 and height > 0 and width * height * 4 == len(rgbx)
@@ -505,6 +592,7 @@ def encode_tight(
         if jpeg is not None:
             return jpeg
     pixels = pack_tight(rgbx, fmt)
+    _note_encoder("zlib")
     # Bit 0 resets zlib stream 0. High nibble 0 = basic compression, copy filter.
     control = TIGHT_BASIC_RESET
     if len(pixels) < TIGHT_MIN_COMPRESS:

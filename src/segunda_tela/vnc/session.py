@@ -9,7 +9,9 @@ from typing import Optional
 from ..display.evdi import EvdiError
 from ..display.randr import find_evdi_output, query_layout
 from ..display.virtual import create_virtual_display
-from .input import EvdiTouch, UinputError
+from .encode import describe_jpeg_encoder, set_jpeg_hardware
+from .input import EvdiKeyboard, EvdiTouch, UinputError
+from .va_jpeg import close_va_jpeg
 from .layout import apply_position, install_touch_map, is_extended_right, primary_output, target_right_of
 from .link import VncLinkError, launch_bvnc, prepare_vnc_transport
 from .server import VncServer
@@ -28,6 +30,7 @@ class UsbVncSession:
         port: int = 5900,
         wait_tether_s: float = 20.0,
         launch: bool = True,
+        allow_hw: bool = True,
     ) -> None:
         self.width = width
         self.height = height
@@ -35,12 +38,14 @@ class UsbVncSession:
         self.port = port
         self.wait_tether_s = wait_tether_s
         self.launch = launch
+        self.allow_hw = allow_hw
         self.notes: list[str] = []
         self.password = ""
         self._display = None
         self._transport = None
         self._server: Optional[VncServer] = None
         self._touch: Optional[EvdiTouch] = None
+        self._keys: Optional[EvdiKeyboard] = None
         self._pump: Optional[threading.Thread] = None
         self._stop = threading.Event()
         self._bvnc_auto = False
@@ -95,6 +100,16 @@ class UsbVncSession:
                     self.notes.append(f"Toque do uinput confirmado em {output_name} ({path}).")
                 except OSError as exc:
                     self.notes.append(f"Não gravei o map_to_output do COSMIC: {exc}")
+        self._keys = EvdiKeyboard()
+        try:
+            self._keys.open()
+        except UinputError as exc:
+            self.notes.append(f"Teclado/roda indisponível: {exc}")
+            self._keys = None
+        set_jpeg_hardware(self.allow_hw)
+        encoder = describe_jpeg_encoder(self.allow_hw)
+        log.info("VNC encoder: %s", encoder)
+        self.notes.append(f"Encoder: {encoder}.")
         self._server = VncServer(
             password=self.password,
             width=width,
@@ -103,6 +118,8 @@ class UsbVncSession:
             port=self._transport.port,
             fps=self.fps,
             on_pointer=self._touch.pointer if self._touch else None,
+            on_wheel=self._keys.wheel if self._keys else None,
+            on_key=self._keys.key if self._keys else None,
         )
         if self._touch:
             self._server.on_resize = self._touch.reconfigure
@@ -150,6 +167,10 @@ class UsbVncSession:
         if self._touch:
             self._touch.close()
             self._touch = None
+        if self._keys:
+            self._keys.close()
+            self._keys = None
+        close_va_jpeg()
         if self._transport:
             self._transport.close()
             self._transport = None

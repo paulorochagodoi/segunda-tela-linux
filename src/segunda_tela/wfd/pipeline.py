@@ -90,7 +90,22 @@ def gst_element_available(name: str) -> bool:
         return False
 
 
-def pick_encoder(preferred: str = "auto", available: Callable[[str], bool] = gst_element_available) -> str:
+def pick_encoder(
+    preferred: str = "auto",
+    available: Callable[[str], bool] = gst_element_available,
+    allow_hw: bool = True,
+) -> str:
+    """First available encoder. `vah264enc` wins when the VA plugin is installed.
+
+    `--no-hw` sets `allow_hw` false and skips vah264enc/vaapih264enc even if
+    the caller asked for one of them. The wireless WFD graph on this branch
+    already prefers vah264enc (same order as the media-stream branch).
+    """
+    if not allow_hw and (not preferred or preferred == "auto" or preferred in HW_ENCODERS):
+        for name in ("x264enc", "openh264enc"):
+            if available(name):
+                return name
+        return "x264enc"
     if preferred and preferred != "auto":
         return preferred
     for name in ENCODER_ORDER:

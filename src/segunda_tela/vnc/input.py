@@ -12,6 +12,13 @@ import struct
 import threading
 from typing import Optional
 
+from .keys import (
+    REL_HWHEEL,
+    REL_WHEEL,
+    contact_buttons,
+    plan_key,
+    used_keycodes,
+)
 from .layout import UINPUT_NAME
 
 log = logging.getLogger(__name__)
@@ -20,7 +27,7 @@ log = logging.getLogger(__name__)
 # ioctl numbers are _IO/_IOW('U', nr, size) with the sizes checked against
 # the kernel headers: input_event 24, uinput_setup 92, uinput_abs_setup 28.
 BUS_VIRTUAL = 6
-EV_SYN, EV_KEY, EV_ABS = 0, 1, 3
+EV_SYN, EV_KEY, EV_REL, EV_ABS = 0, 1, 2, 3
 SYN_REPORT = 0
 BTN_TOUCH = 330
 BTN_TOOL_FINGER = 325
@@ -46,8 +53,11 @@ UI_DEV_SETUP = _iow(3, 92)
 UI_ABS_SETUP = _iow(4, 28)
 UI_SET_EVBIT = _iow(100, 4)
 UI_SET_KEYBIT = _iow(101, 4)
+UI_SET_RELBIT = _iow(102, 4)
 UI_SET_ABSBIT = _iow(103, 4)
 UI_SET_PROPBIT = _iow(110, 4)
+
+KEYBOARD_NAME = "Segunda Tela VNC Teclado"
 
 
 def input_event(ev_type: int, code: int, value: int) -> bytes:
@@ -175,9 +185,8 @@ class EvdiTouch:
             return
         x = 0 if x < 0 else self._w - 1 if x >= self._w else x
         y = 0 if y < 0 else self._h - 1 if y >= self._h else y
-        # bVNC's left button is bit 0. Any button is a finger: a mask that is
-        # not 1 still has to land on the EVDI output, not be dropped.
-        contact = bool(buttons)
+        # Bits 0–2 are the finger. Wheel bits (3–6) must not click.
+        contact = bool(contact_buttons(buttons))
         with self._lock:
             if contact:
                 if not self._down:
@@ -193,3 +202,96 @@ class EvdiTouch:
                 os.write(self._fd, report)
             except OSError as exc:
                 log.warning("uinput write: %s", exc)
+
+
+class EvdiKeyboard:
+    """Keyboard plus scroll wheel. Not a touchscreen, so COSMIC does not map it to one output."""
+
+    def __init__(self, name: str = KEYBOARD_NAME, path: str = "/dev/uinput") -> None:
+        self.name = name
+        self.path = path
+        self._fd: Optional[int] = None
+        self._lock = threading.Lock()
+        self._shift_down = False
+        self._synth_shift = False
+
+    @property
+    def open_fd(self) -> bool:
+        return self._fd is not None
+
+    def open(self) -> None:
+        import fcntl
+        self.close()
+        try:
+            fd = os.open(self.path, os.O_WRONLY | os.O_NONBLOCK)
+        except OSError as exc:
+            raise UinputError(
+                f"não abri {self.path} ({exc}). Rode sudo ./scripts/install-deps-popos.sh "
+                "e entre de novo na sessão (a regra udev dá uaccess em /dev/uinput)."
+            ) from exc
+        try:
+            for bit in (EV_SYN, EV_KEY, EV_REL):
+                fcntl.ioctl(fd, UI_SET_EVBIT, bit)
+            for code in used_keycodes():
+                fcntl.ioctl(fd, UI_SET_KEYBIT, code)
+            for code in (REL_WHEEL, REL_HWHEEL):
+                fcntl.ioctl(fd, UI_SET_RELBIT, code)
+            fcntl.ioctl(fd, UI_DEV_SETUP, _setup_blob(self.name))
+            fcntl.ioctl(fd, UI_DEV_CREATE, 0)
+        except OSError as exc:
+            os.close(fd)
+            raise UinputError(f"uinput teclado falhou: {exc}") from exc
+        self._fd = fd
+        self._shift_down = False
+        self._synth_shift = False
+        log.info("uinput '%s' (teclado e roda) em %s", self.name, self.path)
+
+    def close(self) -> None:
+        import fcntl
+        fd = self._fd
+        self._fd = None
+        if fd is None:
+            return
+        try:
+            fcntl.ioctl(fd, UI_DEV_DESTROY, 0)
+        except OSError:
+            pass
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+
+    def _write(self, payload: bytes) -> None:
+        if self._fd is None or not payload:
+            return
+        try:
+            os.write(self._fd, payload)
+        except OSError as exc:
+            log.warning("uinput teclado: %s", exc)
+
+    def key(self, keysym: int, down: bool) -> None:
+        if self._fd is None:
+            return
+        with self._lock:
+            planned = plan_key(
+                keysym, down, shift_down=self._shift_down, synth_shift=self._synth_shift,
+            )
+            if planned is None:
+                log.info("VNC key sem mapa keysym=%#x", keysym)
+                return
+            events, self._shift_down, self._synth_shift = planned
+            payload = b"".join(input_event(EV_KEY, code, value) for code, value in events)
+            payload += input_event(EV_SYN, SYN_REPORT, 0)
+            self._write(payload)
+
+    def wheel(self, dx: int, dy: int) -> None:
+        if self._fd is None or (dx == 0 and dy == 0):
+            return
+        parts = []
+        if dy:
+            parts.append(input_event(EV_REL, REL_WHEEL, dy))
+        if dx:
+            parts.append(input_event(EV_REL, REL_HWHEEL, dx))
+        parts.append(input_event(EV_SYN, SYN_REPORT, 0))
+        with self._lock:
+            self._write(b"".join(parts))

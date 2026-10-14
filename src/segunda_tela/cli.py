@@ -65,6 +65,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="H.264 encoder: auto|vah264enc|vaapih264enc|x264enc|openh264enc",
     )
     p.add_argument(
+        "--no-hw",
+        action="store_true",
+        help="CPU only. WFD skips vah264enc/vaapih264enc. USB VNC Tight JPEG uses libjpeg "
+             "instead of vajpegenc.",
+    )
+    p.add_argument(
         "--audio",
         action="store_true",
         help="Send desktop audio. A silent AAC/LPCM track is already negotiated when the sink offers one "
@@ -254,6 +260,7 @@ def main(argv: list[str] | None = None) -> int:
             port=5900,
             wait_tether_s=args.usb_wait,
             launch=not args.no_usb_launch,
+            allow_hw=not args.no_hw,
         )
 
         def _stop(*_a):
@@ -335,6 +342,7 @@ def main(argv: list[str] | None = None) -> int:
         audio=args.audio,
         probe_hdcp=args.probe_hdcp,
         gnd_compat=args.gnd_compat,
+        allow_hw=not args.no_hw,
     )
 
     def _stop(*_a):
